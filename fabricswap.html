@@ -1,0 +1,1571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>FabricSwap</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html, body { height: 100%; overscroll-behavior: none; }
+  body { background: #fafaf9; color: #1c1917; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  .handle { touch-action: none; }
+
+  .cbar { position: absolute; width: 40px; height: 40px; margin-left: -20px; margin-top: -20px; }
+  .cbar::before, .cbar::after { content: ""; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); border-radius: 1px; }
+  .cbar::before { width: 3px; height: 28px; background: rgb(234 88 12); box-shadow: 0 0 0 1px rgba(255,255,255,0.9); }
+  .cbar::after { width: 1px; height: 28px; background: black; }
+  .cbar.vmode::before { width: 28px; height: 3px; }
+  .cbar.vmode::after  { width: 28px; height: 1px; }
+
+  .crop-corner { position: absolute; width: 22px; height: 22px; margin-left: -11px; margin-top: -11px; background: white; border: 2px solid rgb(234 88 12); border-radius: 4px; touch-action: none; }
+  .crop-edge { position: absolute; background: transparent; touch-action: none; }
+
+  .seg-stage { position: relative; display: inline-block; max-width: 100%; }
+  .seg-stage canvas, .seg-stage img { display: block; max-width: 100%; height: auto; border-radius: 12px; }
+  .seg-canvas-overlay { position: absolute; inset: 0; pointer-events: none; }
+  .seg-click-layer { position: absolute; inset: 0; cursor: crosshair; touch-action: none; }
+  .region-swatch { width: 18px; height: 18px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.1); }
+
+  .tag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; background: #f5f5f4; color: #44403c; font-size: 12px; line-height: 1.4; border: 1px solid #e7e5e4; }
+  .tag button { background: none; border: 0; padding: 0; margin: 0; color: #78716c; cursor: pointer; font-size: 14px; line-height: 1; }
+  .tag.selected { background: #1c1917; color: white; border-color: #1c1917; }
+  .suggestion { padding: 6px 10px; cursor: pointer; font-size: 14px; }
+  .suggestion:hover, .suggestion.active { background: #f5f5f4; }
+
+  /* Try fabric page */
+  .try-stage { position: relative; display: inline-block; max-width: 100%; width: 100%; }
+  .try-stage canvas { display: block; width: 100%; height: auto; border-radius: 12px; background: #f5f5f4; }
+  .slider-row { display: flex; align-items: center; gap: 8px; }
+  .slider-row label { font-size: 12px; color: #57534e; width: 70px; flex-shrink: 0; }
+  .slider-row input[type=range] { flex: 1; }
+  .slider-row .val { font-size: 11px; color: #78716c; width: 48px; text-align: right; font-variant-numeric: tabular-nums; }
+  .fabric-pick {
+    width: 36px; height: 36px; border-radius: 6px; object-fit: cover;
+    border: 2px solid transparent; cursor: pointer;
+  }
+  .fabric-pick.selected { border-color: #ea580c; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script type="module">
+import { openDB } from "https://cdn.jsdelivr.net/npm/idb@8/+esm";
+import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.mjs";
+
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
+
+// ============================================================
+// IndexedDB (unchanged from Phase 3)
+// ============================================================
+const dbPromise = openDB("fabricswap", 2, {
+  upgrade(db, oldVersion) {
+    if (oldVersion < 1) {
+      const items = db.createObjectStore("items", { keyPath: "id" });
+      items.createIndex("by-updated", "updatedAt");
+      const fabrics = db.createObjectStore("fabrics", { keyPath: "id" });
+      fabrics.createIndex("by-updated", "updatedAt");
+      const projects = db.createObjectStore("projects", { keyPath: "id" });
+      projects.createIndex("by-updated", "updatedAt");
+      const renders = db.createObjectStore("renders", { keyPath: "id" });
+      renders.createIndex("by-project", "projectId");
+      db.createObjectStore("blobs");
+    }
+    if (oldVersion < 2) db.createObjectStore("embeddings");
+  },
+});
+const uid = () => crypto.randomUUID();
+const putBlob = async (k, b) => (await dbPromise).put("blobs", b, k);
+const getBlob = async (k) => (await dbPromise).get("blobs", k);
+const getBlobURL = async (k) => { const b = await getBlob(k); return b ? URL.createObjectURL(b) : null; };
+const delBlob = async (k) => (await dbPromise).delete("blobs", k);
+const putItem = async (r) => (await dbPromise).put("items", r);
+const getItem = async (id) => (await dbPromise).get("items", id);
+const delItem = async (id) => (await dbPromise).delete("items", id);
+const listItems = async () => { const all = await (await dbPromise).getAll("items"); return all.sort((a,b)=>b.updatedAt-a.updatedAt); };
+const putFabric = async (r) => (await dbPromise).put("fabrics", r);
+const getFabric = async (id) => (await dbPromise).get("fabrics", id);
+const delFabric = async (id) => (await dbPromise).delete("fabrics", id);
+const listFabrics = async () => { const all = await (await dbPromise).getAll("fabrics"); return all.sort((a,b)=>b.updatedAt-a.updatedAt); };
+const putEmbedding = async (k, v) => (await dbPromise).put("embeddings", v, k);
+const getEmbedding = async (k) => (await dbPromise).get("embeddings", k);
+const delEmbedding = async (k) => (await dbPromise).delete("embeddings", k);
+
+async function getAllTags() {
+  const items = await listItems();
+  const fabrics = await listFabrics();
+  const set = new Map();
+  for (const r of [...items, ...fabrics]) for (const t of (r.tags || [])) {
+    const key = t.toLowerCase().trim();
+    if (!key) continue;
+    if (!set.has(key)) set.set(key, t.trim());
+  }
+  return [...set.values()].sort((a, b) => a.localeCompare(b));
+}
+function dedupeTags(tags) {
+  const seen = new Map();
+  for (const t of tags) {
+    const trimmed = String(t || "").trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (!seen.has(key)) seen.set(key, trimmed);
+  }
+  return [...seen.values()];
+}
+async function bumpUsage(kind, id) {
+  if (kind === "item") { const r = await getItem(id); if (r) { r.lastUsedAt = Date.now(); await putItem(r); } }
+  if (kind === "fabric") { const r = await getFabric(id); if (r) { r.lastUsedAt = Date.now(); await putFabric(r); } }
+}
+
+// ============================================================
+// Router
+// ============================================================
+const routes = [];
+const route = (pattern, fn) => routes.push({ pattern, fn });
+const navigate = (hash) => { window.location.hash = hash; };
+window.addEventListener("hashchange", render);
+window.addEventListener("DOMContentLoaded", render);
+function matchRoute(hash) {
+  for (const r of routes) if (r.pattern === hash) return { fn: r.fn, params: {} };
+  for (const r of routes) {
+    const pp = r.pattern.split("/"); const hp = hash.split("/");
+    if (pp.length !== hp.length) continue;
+    const params = {}; let ok = true;
+    for (let i = 0; i < pp.length; i++) {
+      if (pp[i].startsWith(":")) params[pp[i].slice(1)] = decodeURIComponent(hp[i]);
+      else if (pp[i] !== hp[i]) { ok = false; break; }
+    }
+    if (ok) return { fn: r.fn, params };
+  }
+  return null;
+}
+function render() {
+  const hash = window.location.hash.replace(/^#/, "") || "/";
+  const matched = matchRoute(hash) || matchRoute("/");
+  const app = document.getElementById("app");
+  app.innerHTML = `
+    <header class="border-b border-stone-200 bg-white">
+      <div class="mx-auto flex max-w-3xl items-center gap-4 p-3">
+        <a href="#/" class="font-semibold">FabricSwap</a>
+        <nav class="flex gap-3 text-sm text-stone-600">
+          <a href="#/items">Items</a>
+          <a href="#/fabrics">Fabrics</a>
+          <a href="#/projects">Projects</a>
+        </nav>
+      </div>
+    </header>
+    <main id="main"></main>
+  `;
+  matched.fn(document.getElementById("main"), matched.params);
+}
+const el = (html) => { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstElementChild; };
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ url, width: img.naturalWidth, height: img.naturalHeight, img });
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+async function cropImageToBlob(dataUrl, rect) {
+  const { img } = await loadImage(dataUrl);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(rect.w); canvas.height = Math.round(rect.h);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h);
+  const blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", 0.92));
+  return { blob };
+}
+
+// ============================================================
+// Reusable: ImageUpload, CalibrateLine, CropTool, TagEditor
+// (unchanged — same as Phase 3)
+// ============================================================
+function ImageUpload(onPicked, label = "Upload image") {
+  const node = el(`
+    <div class="cursor-pointer rounded-2xl border-2 border-dashed border-stone-300 p-8 text-center hover:border-stone-500">
+      <input type="file" accept="image/*" capture="environment" class="hidden" />
+      <div class="text-stone-600">
+        <div class="text-lg font-medium">${esc(label)}</div>
+        <div class="mt-1 text-sm">Tap to choose, drop, or take a photo</div>
+      </div>
+    </div>
+  `);
+  const input = node.querySelector("input");
+  const handle = (file) => {
+    if (!file || !file.type.startsWith("image/")) { alert("Please select an image file."); return; }
+    const r = new FileReader();
+    r.onload = () => onPicked(file, r.result);
+    r.readAsDataURL(file);
+  };
+  node.addEventListener("click", () => input.click());
+  input.addEventListener("change", (e) => handle(e.target.files?.[0]));
+  node.addEventListener("dragover", (e) => { e.preventDefault(); node.classList.add("border-stone-900","bg-stone-100"); });
+  node.addEventListener("dragleave", () => node.classList.remove("border-stone-900","bg-stone-100"));
+  node.addEventListener("drop", (e) => { e.preventDefault(); node.classList.remove("border-stone-900","bg-stone-100"); handle(e.dataTransfer.files?.[0]); });
+  return node;
+}
+
+function CalibrateLine(imageUrl, onConfirm, onCancel) {
+  const node = el(`
+    <div class="flex flex-col gap-4">
+      <div class="mx-auto flex w-full max-w-2xl gap-2">
+        <button class="flex-1 rounded-lg px-3 py-2 text-sm font-medium border" data-mode="h">Horizontal</button>
+        <button class="flex-1 rounded-lg px-3 py-2 text-sm font-medium border" data-mode="v">Vertical</button>
+      </div>
+      <div class="relative mx-auto w-full max-w-2xl touch-none select-none" data-stage>
+        <img src="${esc(imageUrl)}" alt="" class="block w-full rounded-xl" draggable="false" data-img />
+        <svg class="pointer-events-none absolute inset-0 h-full w-full" data-svg>
+          <line stroke="black" stroke-width="1" data-line-center />
+          <line stroke="rgb(234 88 12)" stroke-width="2" stroke-dasharray="6 4" data-line />
+        </svg>
+        <div class="cbar handle" data-h="p1"></div>
+        <div class="cbar handle" data-h="p2"></div>
+      </div>
+      <div class="mx-auto flex w-full max-w-2xl flex-col gap-3 rounded-xl bg-white p-4 shadow-sm">
+        <label class="flex items-center gap-3">
+          <span class="font-medium">This line is</span>
+          <input type="number" inputmode="decimal" step="0.01" min="0" value="1" class="w-24 rounded-md border border-stone-300 px-2 py-1" data-inches />
+          <span>inches</span>
+          <span class="ml-auto text-sm text-stone-500" data-ppi>✓ – px/in</span>
+        </label>
+        <div class="flex gap-2">
+          <button class="flex-1 rounded-lg border border-stone-300 bg-white px-4 py-2 font-medium" data-cancel>Cancel</button>
+          <button class="flex-1 rounded-lg bg-stone-900 px-4 py-2 font-medium text-white" data-confirm>Confirm</button>
+        </div>
+      </div>
+    </div>
+  `);
+  const stage=node.querySelector("[data-stage]"), img=node.querySelector("[data-img]"), svg=node.querySelector("[data-svg]");
+  const line=node.querySelector("[data-line]"), center=node.querySelector("[data-line-center]");
+  const h1=node.querySelector('[data-h="p1"]'), h2=node.querySelector('[data-h="p2"]');
+  const inchesInput=node.querySelector("[data-inches]"), ppiLabel=node.querySelector("[data-ppi]");
+  const modeBtnH=node.querySelector('[data-mode="h"]'), modeBtnV=node.querySelector('[data-mode="v"]');
+  let mode="h", p1={x:.25,y:.5}, p2={x:.75,y:.5}, imgSize=null, dragging=null;
+  const setMode = (m) => { mode = m; if(m==="h"){p1={x:.2,y:.5};p2={x:.8,y:.5};} else {p1={x:.5,y:.2};p2={x:.5,y:.8};} updateModeButtons(); updateBarClasses(); update(); };
+  const updateModeButtons = () => {
+    const a="bg-stone-900 text-white border-stone-900", i="bg-white text-stone-700 border-stone-300";
+    modeBtnH.className=`flex-1 rounded-lg px-3 py-2 text-sm font-medium border ${mode==='h'?a:i}`;
+    modeBtnV.className=`flex-1 rounded-lg px-3 py-2 text-sm font-medium border ${mode==='v'?a:i}`;
+  };
+  const updateBarClasses = () => { [h1,h2].forEach(h=>{h.classList.toggle("hmode",mode==="h");h.classList.toggle("vmode",mode==="v");}); };
+  modeBtnH.addEventListener("click", () => setMode("h"));
+  modeBtnV.addEventListener("click", () => setMode("v"));
+  const ready = () => { imgSize={w:img.naturalWidth,h:img.naturalHeight}; updateModeButtons(); updateBarClasses(); update(); };
+  img.addEventListener("load", ready); if (img.complete && img.naturalWidth) ready();
+  window.addEventListener("resize", update);
+  function update() {
+    const r=img.getBoundingClientRect(); svg.setAttribute("viewBox",`0 0 ${r.width} ${r.height}`);
+    const d1={x:p1.x*r.width,y:p1.y*r.height}, d2={x:p2.x*r.width,y:p2.y*r.height};
+    line.setAttribute("x1",d1.x);line.setAttribute("y1",d1.y);line.setAttribute("x2",d2.x);line.setAttribute("y2",d2.y);
+    center.setAttribute("x1",d1.x);center.setAttribute("y1",d1.y);center.setAttribute("x2",d2.x);center.setAttribute("y2",d2.y);
+    h1.style.left=d1.x+"px";h1.style.top=d1.y+"px";h2.style.left=d2.x+"px";h2.style.top=d2.y+"px";
+    if(imgSize){const dx=(p2.x-p1.x)*imgSize.w,dy=(p2.y-p1.y)*imgSize.h,inches=parseFloat(inchesInput.value)||1;ppiLabel.textContent=`✓ ${(Math.hypot(dx,dy)/inches).toFixed(1)} px/in`;}
+  }
+  const onDown = (which) => (e) => { e.preventDefault(); dragging = which; };
+  h1.addEventListener("pointerdown", onDown("p1")); h2.addEventListener("pointerdown", onDown("p2"));
+  stage.addEventListener("pointermove",(e)=>{ if(!dragging)return; const r=img.getBoundingClientRect(); const x=Math.max(0,Math.min(1,(e.clientX-r.left)/r.width)), y=Math.max(0,Math.min(1,(e.clientY-r.top)/r.height)); if(mode==="h"){if(dragging==="p1")p1.x=x;else p2.x=x;p1.y=y;p2.y=y;} else{if(dragging==="p1")p1.y=y;else p2.y=y;p1.x=x;p2.x=x;} update(); });
+  const endDrag = () => (dragging = null);
+  window.addEventListener("pointerup",endDrag); window.addEventListener("pointercancel",endDrag);
+  inchesInput.addEventListener("input", update);
+  node.querySelector("[data-cancel]").addEventListener("click", onCancel);
+  node.querySelector("[data-confirm]").addEventListener("click", () => {
+    const inches=parseFloat(inchesInput.value);
+    if(!imgSize||!inches||inches<=0) return alert("Enter a valid length in inches.");
+    const dx=(p2.x-p1.x)*imgSize.w, dy=(p2.y-p1.y)*imgSize.h, pxLen=Math.hypot(dx,dy);
+    if(pxLen<5) return alert("Line is too short — drag the bars apart.");
+    onConfirm({ pixelsPerInch:pxLen/inches, linePoints:[{x:p1.x*imgSize.w,y:p1.y*imgSize.h},{x:p2.x*imgSize.w,y:p2.y*imgSize.h}], realWorldInches:inches, orientation:mode });
+  });
+  return node;
+}
+
+function CropTool(imageUrl, onApply, onSkip, onCancel) {
+  const node = el(`
+    <div class="flex flex-col gap-4">
+      <div class="relative mx-auto w-full max-w-2xl touch-none select-none" data-stage>
+        <img src="${esc(imageUrl)}" alt="" class="block w-full rounded-xl" draggable="false" data-img />
+        <svg class="pointer-events-none absolute inset-0 h-full w-full" data-svg>
+          <defs><mask id="cropmask"><rect x="0" y="0" width="100%" height="100%" fill="white"/><rect data-hole fill="black"/></mask></defs>
+          <rect x="0" y="0" width="100%" height="100%" fill="rgba(0,0,0,0.45)" mask="url(#cropmask)"/>
+          <rect data-box fill="none" stroke="rgb(234 88 12)" stroke-width="2"/>
+        </svg>
+        <div class="absolute inset-0" data-move style="cursor:move"></div>
+        <div class="crop-corner" data-h="nw" style="cursor:nwse-resize"></div>
+        <div class="crop-corner" data-h="ne" style="cursor:nesw-resize"></div>
+        <div class="crop-corner" data-h="sw" style="cursor:nesw-resize"></div>
+        <div class="crop-corner" data-h="se" style="cursor:nwse-resize"></div>
+        <div class="crop-edge" data-h="n" style="height:20px;margin-top:-10px;cursor:ns-resize"></div>
+        <div class="crop-edge" data-h="s" style="height:20px;margin-top:-10px;cursor:ns-resize"></div>
+        <div class="crop-edge" data-h="w" style="width:20px;margin-left:-10px;cursor:ew-resize"></div>
+        <div class="crop-edge" data-h="e" style="width:20px;margin-left:-10px;cursor:ew-resize"></div>
+      </div>
+      <div class="mx-auto flex w-full max-w-2xl flex-col gap-3 rounded-xl bg-white p-4 shadow-sm">
+        <div class="text-sm font-medium">Crop (optional)</div>
+        <p class="text-xs text-stone-500">Drag edges or corners inward to trim rulers, borders, or watermarks.</p>
+        <div class="flex gap-2">
+          <button class="flex-1 rounded-lg border border-stone-300 bg-white px-4 py-2 font-medium" data-reset>Reset</button>
+          <button class="flex-1 rounded-lg border border-stone-300 bg-white px-4 py-2 font-medium" data-cancel>Back</button>
+          <button class="flex-1 rounded-lg border border-stone-300 bg-white px-4 py-2 font-medium" data-skip>Skip crop</button>
+          <button class="flex-1 rounded-lg bg-stone-900 px-4 py-2 font-medium text-white" data-apply>Apply crop</button>
+        </div>
+      </div>
+    </div>
+  `);
+  const stage=node.querySelector("[data-stage]"),img=node.querySelector("[data-img]"),svg=node.querySelector("[data-svg]"),box=node.querySelector("[data-box]"),hole=node.querySelector("[data-hole]"),moveLayer=node.querySelector("[data-move]");
+  let rect={x:0,y:0,w:1,h:1},drag=null,imgSize=null;
+  const ready=()=>{imgSize={w:img.naturalWidth,h:img.naturalHeight};update();};
+  img.addEventListener("load",ready); if(img.complete&&img.naturalWidth)ready();
+  window.addEventListener("resize",update);
+  ["nw","ne","sw","se","n","s","w","e"].forEach(c=>{node.querySelector(`[data-h="${c}"]`).addEventListener("pointerdown",(e)=>{e.preventDefault();e.stopPropagation();drag={type:c,startX:e.clientX,startY:e.clientY,startRect:{...rect}};});});
+  moveLayer.addEventListener("pointerdown",(e)=>{const r=img.getBoundingClientRect(),nx=(e.clientX-r.left)/r.width,ny=(e.clientY-r.top)/r.height;if(nx>=rect.x&&nx<=rect.x+rect.w&&ny>=rect.y&&ny<=rect.y+rect.h){e.preventDefault();drag={type:"move",startX:e.clientX,startY:e.clientY,startRect:{...rect}};}});
+  stage.addEventListener("pointermove",(e)=>{if(!drag)return;const r=img.getBoundingClientRect(),dx=(e.clientX-drag.startX)/r.width,dy=(e.clientY-drag.startY)/r.height;let nr={...drag.startRect};const min=0.05;if(drag.type==="move"){nr.x=Math.max(0,Math.min(1-nr.w,nr.x+dx));nr.y=Math.max(0,Math.min(1-nr.h,nr.y+dy));}else{if(drag.type.includes("w")){const nx=Math.max(0,Math.min(nr.x+nr.w-min,nr.x+dx));nr.w+=nr.x-nx;nr.x=nx;}if(drag.type.includes("e"))nr.w=Math.max(min,Math.min(1-nr.x,nr.w+dx));if(drag.type.includes("n")){const ny=Math.max(0,Math.min(nr.y+nr.h-min,nr.y+dy));nr.h+=nr.y-ny;nr.y=ny;}if(drag.type.includes("s"))nr.h=Math.max(min,Math.min(1-nr.y,nr.h+dy));}rect=nr;update();});
+  const endDrag=()=>(drag=null); window.addEventListener("pointerup",endDrag); window.addEventListener("pointercancel",endDrag);
+  function update(){const r=img.getBoundingClientRect();svg.setAttribute("viewBox",`0 0 ${r.width} ${r.height}`);const x=rect.x*r.width,y=rect.y*r.height,w=rect.w*r.width,h=rect.h*r.height;box.setAttribute("x",x);box.setAttribute("y",y);box.setAttribute("width",w);box.setAttribute("height",h);hole.setAttribute("x",x);hole.setAttribute("y",y);hole.setAttribute("width",w);hole.setAttribute("height",h);const place=(sel,cx,cy)=>{const e=node.querySelector(sel);e.style.left=cx+"px";e.style.top=cy+"px";};place('[data-h="nw"]',x,y);place('[data-h="ne"]',x+w,y);place('[data-h="sw"]',x,y+h);place('[data-h="se"]',x+w,y+h);const n=node.querySelector('[data-h="n"]');n.style.left=x+"px";n.style.top=y+"px";n.style.width=w+"px";const s=node.querySelector('[data-h="s"]');s.style.left=x+"px";s.style.top=(y+h)+"px";s.style.width=w+"px";const w_=node.querySelector('[data-h="w"]');w_.style.left=x+"px";w_.style.top=y+"px";w_.style.height=h+"px";const e_=node.querySelector('[data-h="e"]');e_.style.left=(x+w)+"px";e_.style.top=y+"px";e_.style.height=h+"px";}
+  node.querySelector("[data-reset]").addEventListener("click",()=>{rect={x:0,y:0,w:1,h:1};update();});
+  node.querySelector("[data-cancel]").addEventListener("click",onCancel);
+  node.querySelector("[data-skip]").addEventListener("click",onSkip);
+  node.querySelector("[data-apply]").addEventListener("click",()=>{if(!imgSize)return;if(rect.x===0&&rect.y===0&&rect.w===1&&rect.h===1){onSkip();return;}onApply({x:rect.x*imgSize.w,y:rect.y*imgSize.h,w:rect.w*imgSize.w,h:rect.h*imgSize.h});});
+  return node;
+}
+
+function TagEditor({ initialTags = [], onChange }) {
+  const node = el(`
+    <div class="flex flex-col gap-2">
+      <div class="flex flex-wrap items-center gap-1 rounded-md border border-stone-300 bg-white p-2" data-chips>
+        <input type="text" placeholder="Add tag…" class="min-w-[100px] flex-1 border-0 outline-none text-sm" data-input />
+      </div>
+      <div class="relative">
+        <div class="absolute left-0 right-0 top-0 z-10 rounded-md border border-stone-200 bg-white shadow-sm hidden" data-suggestions></div>
+      </div>
+    </div>
+  `);
+  const chips=node.querySelector("[data-chips]"),input=node.querySelector("[data-input]"),suggestions=node.querySelector("[data-suggestions]");
+  let tags=dedupeTags(initialTags),allTags=[],activeIdx=-1;
+  const emit=()=>onChange&&onChange([...tags]);
+  const renderChips=()=>{[...chips.querySelectorAll(".tag")].forEach(e=>e.remove());tags.forEach((t,i)=>{const chip=el(`<span class="tag">${esc(t)}<button data-del="${i}" aria-label="Remove">×</button></span>`);chip.querySelector("button").addEventListener("click",()=>{tags.splice(i,1);renderChips();emit();});chips.insertBefore(chip,input);});};
+  const addTag=(raw)=>{const t=String(raw||"").trim().replace(/,$/,"");if(!t)return;const exists=tags.some(x=>x.toLowerCase()===t.toLowerCase());if(!exists)tags.push(t);input.value="";hideSuggestions();renderChips();emit();};
+  const showSuggestions=()=>{const q=input.value.trim().toLowerCase();const filtered=allTags.filter(t=>{if(tags.some(x=>x.toLowerCase()===t.toLowerCase()))return false;if(!q)return true;return t.toLowerCase().includes(q);}).slice(0,8);if(filtered.length===0){hideSuggestions();return;}suggestions.innerHTML="";filtered.forEach((t,i)=>{const s=el(`<div class="suggestion ${i===activeIdx?'active':''}">${esc(t)}</div>`);s.addEventListener("mousedown",(e)=>{e.preventDefault();addTag(t);});suggestions.appendChild(s);});suggestions.classList.remove("hidden");};
+  const hideSuggestions=()=>{suggestions.classList.add("hidden");activeIdx=-1;};
+  input.addEventListener("input",()=>{activeIdx=-1;showSuggestions();});
+  input.addEventListener("focus",()=>{getAllTags().then(all=>{allTags=all;showSuggestions();});});
+  input.addEventListener("blur",()=>setTimeout(hideSuggestions,150));
+  input.addEventListener("keydown",(e)=>{if(e.key==="Enter"||e.key===","){e.preventDefault();addTag(input.value);}else if(e.key==="Backspace"&&!input.value&&tags.length>0){tags.pop();renderChips();emit();}else if(e.key==="ArrowDown"){const items=suggestions.querySelectorAll(".suggestion");if(items.length){activeIdx=Math.min(items.length-1,activeIdx+1);items.forEach((it,i)=>it.classList.toggle("active",i===activeIdx));e.preventDefault();}}else if(e.key==="ArrowUp"){const items=suggestions.querySelectorAll(".suggestion");if(items.length){activeIdx=Math.max(0,activeIdx-1);items.forEach((it,i)=>it.classList.toggle("active",i===activeIdx));e.preventDefault();}}else if(e.key==="Escape")hideSuggestions();else if(e.key==="Tab"&&activeIdx>=0){const items=suggestions.querySelectorAll(".suggestion");if(items[activeIdx]){e.preventDefault();addTag(items[activeIdx].textContent);}}});
+  renderChips();
+  return node;
+}
+
+// ============================================================
+// SAM (unchanged)
+// ============================================================
+const SAM_ENCODER_URL = "https://huggingface.co/Xenova/slimsam-77-uniform/resolve/main/onnx/vision_encoder.onnx";
+const SAM_DECODER_URL = "https://huggingface.co/Xenova/slimsam-77-uniform/resolve/main/onnx/mask_decoder.onnx";
+const SAM_IMAGE_SIZE = 1024;
+let encoderSession = null, decoderSession = null;
+async function fetchWithProgress(url, onProgress) {
+  const cache = await caches.open("fabricswap-models-v1");
+  const cached = await cache.match(url);
+  if (cached) { const buf = await cached.arrayBuffer(); onProgress(1, buf.byteLength, buf.byteLength); return buf; }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("Failed to fetch model: " + url);
+  const total = Number(res.headers.get("content-length")) || 0;
+  const reader = res.body.getReader();
+  const chunks = []; let loaded = 0;
+  while (true) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); loaded += value.length; onProgress(total ? loaded / total : 0, loaded, total); }
+  const buf = new Uint8Array(loaded); let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.length; }
+  try { await cache.put(url, new Response(buf.slice(0), { headers: { "content-length": String(loaded), "content-type": "application/octet-stream" } })); } catch {}
+  return buf.buffer;
+}
+async function loadSAM(onProgress) {
+  if (encoderSession && decoderSession) return;
+  onProgress({ stage: "Downloading encoder", pct: 0 });
+  const encBuf = await fetchWithProgress(SAM_ENCODER_URL, (pct) => onProgress({ stage: "Downloading encoder", pct }));
+  onProgress({ stage: "Downloading decoder", pct: 0 });
+  const decBuf = await fetchWithProgress(SAM_DECODER_URL, (pct) => onProgress({ stage: "Downloading decoder", pct }));
+  onProgress({ stage: "Initializing model", pct: 0 });
+  encoderSession = await ort.InferenceSession.create(encBuf, { executionProviders: ["wasm"] });
+  decoderSession = await ort.InferenceSession.create(decBuf, { executionProviders: ["wasm"] });
+  onProgress({ stage: "Ready", pct: 1 });
+}
+async function preprocessImage(img) {
+  const srcW=img.naturalWidth,srcH=img.naturalHeight,scale=SAM_IMAGE_SIZE/Math.max(srcW,srcH),newW=Math.round(srcW*scale),newH=Math.round(srcH*scale);
+  const canvas=document.createElement("canvas");canvas.width=SAM_IMAGE_SIZE;canvas.height=SAM_IMAGE_SIZE;
+  const ctx=canvas.getContext("2d");ctx.fillStyle="black";ctx.fillRect(0,0,SAM_IMAGE_SIZE,SAM_IMAGE_SIZE);ctx.drawImage(img,0,0,newW,newH);
+  const data=ctx.getImageData(0,0,SAM_IMAGE_SIZE,SAM_IMAGE_SIZE).data;
+  const mean=[123.675,116.28,103.53],std=[58.395,57.12,57.375];
+  const chw=new Float32Array(3*SAM_IMAGE_SIZE*SAM_IMAGE_SIZE),plane=SAM_IMAGE_SIZE*SAM_IMAGE_SIZE;
+  for(let i=0,p=0;i<data.length;i+=4,p++){chw[p]=(data[i]-mean[0])/std[0];chw[p+plane]=(data[i+1]-mean[1])/std[1];chw[p+2*plane]=(data[i+2]-mean[2])/std[2];}
+  return{tensor:new ort.Tensor("float32",chw,[1,3,SAM_IMAGE_SIZE,SAM_IMAGE_SIZE]),scale,newW,newH,srcW,srcH};
+}
+async function runEncoder(img) {
+  const pre=await preprocessImage(img);const feeds={};feeds[encoderSession.inputNames[0]]=pre.tensor;
+  const out=await encoderSession.run(feeds);
+  return{embedding:out[encoderSession.outputNames[0]],meta:{scale:pre.scale,newW:pre.newW,newH:pre.newH,srcW:pre.srcW,srcH:pre.srcH}};
+}
+function tensorToPlain(t){return{dims:t.dims,type:t.type,data:new Float32Array(t.data)};}
+function plainToTensor(p){return new ort.Tensor(p.type,p.data,p.dims);}
+async function runDecoder(embedding, meta, points) {
+  const inputPoints=[],inputLabels=[];
+  for(const p of points){inputPoints.push(p.x*meta.scale,p.y*meta.scale);inputLabels.push(p.label);}
+  inputPoints.push(0,0);inputLabels.push(-1);
+  const nPts=points.length+1;
+  const coordsTensor=new ort.Tensor("float32",new Float32Array(inputPoints),[1,nPts,2]);
+  const labelsTensor=new ort.Tensor("float32",new Float32Array(inputLabels),[1,nPts]);
+  const maskInput=new ort.Tensor("float32",new Float32Array(256*256),[1,1,256,256]);
+  const hasMask=new ort.Tensor("float32",new Float32Array([0]),[1]);
+  const origSize=new ort.Tensor("float32",new Float32Array([meta.srcH,meta.srcW]),[2]);
+  const feeds={image_embeddings:embedding,point_coords:coordsTensor,point_labels:labelsTensor,mask_input:maskInput,has_mask_input:hasMask,orig_im_size:origSize};
+  const actual={};for(const name of decoderSession.inputNames)if(feeds[name]!==undefined)actual[name]=feeds[name];
+  const out=await decoderSession.run(actual);
+  return{masks:out[decoderSession.outputNames[0]],iou:out[decoderSession.outputNames[1]]};
+}
+async function masksToBestMaskImage(masksTensor, iouTensor, meta) {
+  const dims=masksTensor.dims,n=dims[1],mh=dims[2],mw=dims[3],scores=iouTensor.data;
+  let best=0;for(let i=1;i<n;i++)if(scores[i]>scores[best])best=i;
+  const plane=mh*mw;const src=new Float32Array(masksTensor.data.buffer,masksTensor.data.byteOffset+best*plane*4,plane);
+  const outCanvas=document.createElement("canvas");outCanvas.width=meta.srcW;outCanvas.height=meta.srcH;const octx=outCanvas.getContext("2d");
+  if(mw===meta.srcW&&mh===meta.srcH){const id=octx.createImageData(mw,mh);for(let i=0;i<plane;i++){const v=src[i]>0?255:0;id.data[i*4]=v;id.data[i*4+1]=v;id.data[i*4+2]=v;id.data[i*4+3]=255;}octx.putImageData(id,0,0);}
+  else{const low=document.createElement("canvas");low.width=mw;low.height=mh;const lctx=low.getContext("2d");const id=lctx.createImageData(mw,mh);for(let i=0;i<plane;i++){const v=src[i]>0?255:0;id.data[i*4]=v;id.data[i*4+1]=v;id.data[i*4+2]=v;id.data[i*4+3]=255;}lctx.putImageData(id,0,0);octx.imageSmoothingEnabled=false;octx.drawImage(low,0,0,meta.srcW,meta.srcH);}
+  return{canvas:outCanvas,score:scores[best]};
+}
+function hexToRgb(hex){const n=parseInt(hex.slice(1),16);return{r:(n>>16)&255,g:(n>>8)&255,b:n&255};}
+async function deleteItemCascade(id){const item=await getItem(id);if(!item)return;await delBlob(item.imageBlobKey);if(item.thumbBlobKey)await delBlob(item.thumbBlobKey);for(const reg of(item.regions||[]))if(reg.maskBlobKey)await delBlob(reg.maskBlobKey);await delEmbedding(id);await delItem(id);}
+async function deleteFabricCascade(id){const f=await getFabric(id);if(!f)return;await delBlob(f.imageBlobKey);if(f.thumbBlobKey)await delBlob(f.thumbBlobKey);await delFabric(id);}
+
+// ============================================================
+// PHASE 4 — Fabric swap renderer (WebGL)
+// ============================================================
+
+// Vertex shader — just passes through
+const VS = `
+attribute vec2 a_pos;
+attribute vec2 a_uv;
+varying vec2 v_uv;
+void main() {
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+  v_uv = a_uv;
+}
+`;
+
+// Fragment shader
+// Per-region: samples the fabric with rotation/offset/scale, multiplies by shading, blends via feathered mask.
+// Supports up to 6 regions in one pass.
+const MAX_REGIONS = 5;
+const FS = `
+precision highp float;
+varying vec2 v_uv;
+
+uniform sampler2D u_item;
+
+uniform sampler2D u_fabric0; uniform sampler2D u_mask0; uniform sampler2D u_lowfreq0;
+uniform sampler2D u_fabric1; uniform sampler2D u_mask1; uniform sampler2D u_lowfreq1;
+uniform sampler2D u_fabric2; uniform sampler2D u_mask2; uniform sampler2D u_lowfreq2;
+uniform sampler2D u_fabric3; uniform sampler2D u_mask3; uniform sampler2D u_lowfreq3;
+uniform sampler2D u_fabric4; uniform sampler2D u_mask4; uniform sampler2D u_lowfreq4;
+
+uniform int u_nRegions;
+uniform vec2 u_itemSize;
+uniform vec2 u_fabricSize[5];
+uniform float u_scale[5];
+uniform float u_scaleMult[5];
+uniform float u_rotation[5];
+uniform vec2 u_offset[5];
+uniform float u_foldOn[5];       // 0 or 1
+uniform float u_foldStrength[5]; // 0..1.5
+uniform float u_shadowsOnly[5];  // 0 or 1
+uniform float u_meanLum[5];      // mean of low-freq luminance in region
+
+float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+vec3 applyShade(vec3 fab, float lowLum, float meanLum, float strength, float shadowsOnly) {
+  float ratio = lowLum / max(meanLum, 0.001);
+  float shade = pow(max(ratio, 0.001), strength);
+  // Shadows-only: clamp shade so it never exceeds 1 (no brightening past neutral)
+  shade = mix(shade, min(shade, 1.0), shadowsOnly);
+  return fab * shade;
+}
+
+void main() {
+  vec4 base = texture2D(u_item, v_uv);
+  vec3 color = base.rgb;
+  vec2 itemPx = v_uv * u_itemSize;
+
+  // Region 0
+  if (u_nRegions > 0) {
+    float m = texture2D(u_mask0, v_uv).r;
+    if (m > 0.01) {
+      float c = cos(u_rotation[0]); float s = sin(u_rotation[0]);
+      vec2 rot = vec2(c*itemPx.x - s*itemPx.y, s*itemPx.x + c*itemPx.y);
+      vec2 fp = rot * (u_scale[0] * u_scaleMult[0]) + u_offset[0];
+      vec2 uv = mod(fp / u_fabricSize[0], 1.0);
+      vec3 fab = texture2D(u_fabric0, uv).rgb;
+      if (u_foldOn[0] > 0.5) {
+        float lowLum = luminance(texture2D(u_lowfreq0, v_uv).rgb);
+        fab = applyShade(fab, lowLum, u_meanLum[0], u_foldStrength[0], u_shadowsOnly[0]);
+      }
+      color = mix(color, fab, m);
+    }
+  }
+  // Region 1
+  if (u_nRegions > 1) {
+    float m = texture2D(u_mask1, v_uv).r;
+    if (m > 0.01) {
+      float c = cos(u_rotation[1]); float s = sin(u_rotation[1]);
+      vec2 rot = vec2(c*itemPx.x - s*itemPx.y, s*itemPx.x + c*itemPx.y);
+      vec2 fp = rot * (u_scale[1] * u_scaleMult[1]) + u_offset[1];
+      vec2 uv = mod(fp / u_fabricSize[1], 1.0);
+      vec3 fab = texture2D(u_fabric1, uv).rgb;
+      if (u_foldOn[1] > 0.5) {
+        float lowLum = luminance(texture2D(u_lowfreq1, v_uv).rgb);
+        fab = applyShade(fab, lowLum, u_meanLum[1], u_foldStrength[1], u_shadowsOnly[1]);
+      }
+      color = mix(color, fab, m);
+    }
+  }
+  // Region 2
+  if (u_nRegions > 2) {
+    float m = texture2D(u_mask2, v_uv).r;
+    if (m > 0.01) {
+      float c = cos(u_rotation[2]); float s = sin(u_rotation[2]);
+      vec2 rot = vec2(c*itemPx.x - s*itemPx.y, s*itemPx.x + c*itemPx.y);
+      vec2 fp = rot * (u_scale[2] * u_scaleMult[2]) + u_offset[2];
+      vec2 uv = mod(fp / u_fabricSize[2], 1.0);
+      vec3 fab = texture2D(u_fabric2, uv).rgb;
+      if (u_foldOn[2] > 0.5) {
+        float lowLum = luminance(texture2D(u_lowfreq2, v_uv).rgb);
+        fab = applyShade(fab, lowLum, u_meanLum[2], u_foldStrength[2], u_shadowsOnly[2]);
+      }
+      color = mix(color, fab, m);
+    }
+  }
+  // Region 3
+  if (u_nRegions > 3) {
+    float m = texture2D(u_mask3, v_uv).r;
+    if (m > 0.01) {
+      float c = cos(u_rotation[3]); float s = sin(u_rotation[3]);
+      vec2 rot = vec2(c*itemPx.x - s*itemPx.y, s*itemPx.x + c*itemPx.y);
+      vec2 fp = rot * (u_scale[3] * u_scaleMult[3]) + u_offset[3];
+      vec2 uv = mod(fp / u_fabricSize[3], 1.0);
+      vec3 fab = texture2D(u_fabric3, uv).rgb;
+      if (u_foldOn[3] > 0.5) {
+        float lowLum = luminance(texture2D(u_lowfreq3, v_uv).rgb);
+        fab = applyShade(fab, lowLum, u_meanLum[3], u_foldStrength[3], u_shadowsOnly[3]);
+      }
+      color = mix(color, fab, m);
+    }
+  }
+  // Region 4
+  if (u_nRegions > 4) {
+    float m = texture2D(u_mask4, v_uv).r;
+    if (m > 0.01) {
+      float c = cos(u_rotation[4]); float s = sin(u_rotation[4]);
+      vec2 rot = vec2(c*itemPx.x - s*itemPx.y, s*itemPx.x + c*itemPx.y);
+      vec2 fp = rot * (u_scale[4] * u_scaleMult[4]) + u_offset[4];
+      vec2 uv = mod(fp / u_fabricSize[4], 1.0);
+      vec3 fab = texture2D(u_fabric4, uv).rgb;
+      if (u_foldOn[4] > 0.5) {
+        float lowLum = luminance(texture2D(u_lowfreq4, v_uv).rgb);
+        fab = applyShade(fab, lowLum, u_meanLum[4], u_foldStrength[4], u_shadowsOnly[4]);
+      }
+      color = mix(color, fab, m);
+    }
+  }
+  
+  gl_FragColor = vec4(color, 1.0);
+}
+`;
+
+function compile(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+function makeProgram(gl) {
+  const vs = compile(gl, gl.VERTEX_SHADER, VS);
+  const fs = compile(gl, gl.FRAGMENT_SHADER, FS);
+  const p = gl.createProgram(); gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+function isPowerOfTwo(n) { return (n & (n - 1)) === 0 && n > 0; }
+function nextPowerOfTwo(n) { let p = 1; while (p < n) p <<= 1; return p; }
+
+function makeTexture(gl, img, { linear = true, repeat = false } = {}) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+
+  // WebGL1 requires POT dimensions for REPEAT wrap. If we need REPEAT and the
+  // image isn't POT, resize it onto a POT canvas first.
+  let source = img;
+  if (repeat && (!isPowerOfTwo(w) || !isPowerOfTwo(h))) {
+    const potW = nextPowerOfTwo(w);
+    const potH = nextPowerOfTwo(h);
+    const c = document.createElement("canvas");
+    c.width = potW; c.height = potH;
+    const ctx = c.getContext("2d");
+    ctx.drawImage(img, 0, 0, potW, potH);
+    source = c;
+  }
+
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, repeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, repeat ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, linear ? gl.LINEAR : gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, linear ? gl.LINEAR : gl.NEAREST);
+  return tex;
+}
+
+// Compute mean luminance of item pixels where mask > 0
+async function computeMeanLuminance(itemImg, maskImg) {
+  const w = itemImg.naturalWidth, h = itemImg.naturalHeight;
+  const c1 = document.createElement("canvas"); c1.width = w; c1.height = h;
+  const ctx1 = c1.getContext("2d"); ctx1.drawImage(itemImg, 0, 0);
+  const idat = ctx1.getImageData(0, 0, w, h).data;
+  const c2 = document.createElement("canvas"); c2.width = w; c2.height = h;
+  const ctx2 = c2.getContext("2d"); ctx2.drawImage(maskImg, 0, 0, w, h);
+  const mdat = ctx2.getImageData(0, 0, w, h).data;
+  let sum = 0, count = 0;
+  for (let i = 0; i < idat.length; i += 4) {
+    if (mdat[i] > 128) {
+      const lum = (idat[i] * 0.2126 + idat[i+1] * 0.7152 + idat[i+2] * 0.0722) / 255;
+      sum += lum; count++;
+    }
+  }
+  return count > 0 ? sum / count : 0.5;
+}
+
+function featherMask(maskImg, radiusPx) {
+  const w = maskImg.naturalWidth, h = maskImg.naturalHeight;
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const ctx = c.getContext("2d");
+  ctx.filter = `blur(${Math.max(0.5, radiusPx)}px)`;
+  ctx.drawImage(maskImg, 0, 0);
+  return c;
+}
+
+// Compute region bbox in pixels from a mask image
+function maskBoundingBox(maskImg) {
+  const w = maskImg.naturalWidth, h = maskImg.naturalHeight;
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const ctx = c.getContext("2d"); ctx.drawImage(maskImg, 0, 0);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  let minX = w, minY = h, maxX = 0, maxY = 0, has = false;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (d[(y*w + x)*4] > 128) {
+      if (x < minX) minX = x; if (y < minY) minY = y;
+      if (x > maxX) maxX = x; if (y > maxY) maxY = y;
+      has = true;
+    }
+  }
+  return has ? { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 } : { x: 0, y: 0, w, h };
+}
+
+// Build a low-frequency (heavily blurred) version of the item image, sized at item resolution.
+// Uses a downscale → blur → upscale pipeline so we can achieve very large effective blur radii cheaply.
+// Returns an HTMLCanvasElement at item image resolution.
+function buildLowFreqLighting(itemImg, bboxPx) {
+  const w = itemImg.naturalWidth, h = itemImg.naturalHeight;
+  // Target radius = max(bbox) / 20
+  const targetRadius = Math.max(bboxPx.w, bboxPx.h) / 20;
+
+  // Downscale factor so the browser's blur radius stays well under its ~250px cap.
+  // After downscale, effective blur radius in blurred-space = targetRadius / downscale.
+  const maxBlur = 60; // leave headroom
+  const downscale = Math.max(1, Math.ceil(targetRadius / maxBlur));
+  const smallW = Math.max(16, Math.round(w / downscale));
+  const smallH = Math.max(16, Math.round(h / downscale));
+
+  // Downscale
+  const small = document.createElement("canvas"); small.width = smallW; small.height = smallH;
+  const sctx = small.getContext("2d");
+  sctx.imageSmoothingEnabled = true;
+  sctx.imageSmoothingQuality = "high";
+  sctx.drawImage(itemImg, 0, 0, smallW, smallH);
+
+  // Blur at the downscaled radius
+  const blurred = document.createElement("canvas"); blurred.width = smallW; blurred.height = smallH;
+  const bctx = blurred.getContext("2d");
+  bctx.filter = `blur(${Math.max(1, targetRadius / downscale)}px)`;
+  bctx.drawImage(small, 0, 0);
+
+  // Upscale back to item resolution
+  const out = document.createElement("canvas"); out.width = w; out.height = h;
+  const octx = out.getContext("2d");
+  octx.imageSmoothingEnabled = true;
+  octx.imageSmoothingQuality = "high";
+  octx.drawImage(blurred, 0, 0, w, h);
+  return out;
+}
+
+// Compute the mean luminance of the low-freq image inside the mask.
+// This is the "neutral" value we normalize against; dividing low-freq by this
+// yields a shading map centered on 1.0 (= flat).
+function computeLowFreqMean(lowFreqCanvas, maskImg) {
+  const w = lowFreqCanvas.width, h = lowFreqCanvas.height;
+  const lctx = lowFreqCanvas.getContext("2d");
+  const ldat = lctx.getImageData(0, 0, w, h).data;
+  const mcanvas = document.createElement("canvas"); mcanvas.width = w; mcanvas.height = h;
+  const mctx = mcanvas.getContext("2d"); mctx.drawImage(maskImg, 0, 0, w, h);
+  const mdat = mctx.getImageData(0, 0, w, h).data;
+  let sum = 0, count = 0;
+  for (let i = 0; i < ldat.length; i += 4) {
+    if (mdat[i] > 128) {
+      const lum = (ldat[i] * 0.2126 + ldat[i+1] * 0.7152 + ldat[i+2] * 0.0722) / 255;
+      sum += lum; count++;
+    }
+  }
+  return count > 0 ? sum / count : 0.5;
+}
+
+class FabricSwapRenderer {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.gl = canvas.getContext("webgl", { preserveDrawingBuffer: true, antialias: false });
+    if (!this.gl) throw new Error("WebGL not supported");
+    const gl = this.gl;
+    this.program = makeProgram(gl);
+    this.vbuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vbuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1,-1, 0,0,  1,-1, 1,0,  -1, 1, 0,1,
+      -1, 1, 0,1,  1,-1, 1,0,   1, 1, 1,1,
+    ]), gl.STATIC_DRAW);
+    this.itemTex = null;
+    this.regionTextures = [];
+  }
+
+  setItem(img) {
+    const gl = this.gl;
+    if (this.itemTex) gl.deleteTexture(this.itemTex);
+    this.itemTex = makeTexture(gl, img, { linear: true });
+    this.itemW = img.naturalWidth; this.itemH = img.naturalHeight;
+    this.canvas.width = this.itemW;
+    this.canvas.height = this.itemH;
+  }
+
+  async setRegions(regions) {
+    // regions: [{ fabricImg, maskImg, lowFreqCanvas, lowFreqMean, fabricPPI, itemPPI,
+    //            rotation, offsetX, offsetY, scaleMult,
+    //            foldOn, foldStrength, shadowsOnly }]
+    const gl = this.gl;
+    for (const r of this.regionTextures) {
+      gl.deleteTexture(r.fabric); gl.deleteTexture(r.mask); gl.deleteTexture(r.lowfreq);
+    }
+    this.regionTextures = [];
+    for (const r of regions.slice(0, MAX_REGIONS)) {
+      const fabric = makeTexture(gl, r.fabricImg, { linear: true, repeat: true });
+      const mask = makeTexture(gl, r.maskImg, { linear: true });
+      const lowfreq = makeTexture(gl, r.lowFreqCanvas, { linear: true });
+      this.regionTextures.push({
+        fabric, mask, lowfreq,
+        fabricW: r.fabricImg.naturalWidth || r.fabricImg.width,
+        fabricH: r.fabricImg.naturalHeight || r.fabricImg.height,
+        meanLum: r.lowFreqMean,
+        baseScale: r.fabricPPI / r.itemPPI,
+        rotation: (r.rotation || 0) * Math.PI / 180,
+        offsetX: r.offsetX || 0,
+        offsetY: r.offsetY || 0,
+        scaleMult: r.scaleMult != null ? r.scaleMult : 1,
+        foldOn: r.foldOn ? 1 : 0,
+        foldStrength: r.foldStrength != null ? r.foldStrength : 0.8,
+        shadowsOnly: r.shadowsOnly ? 1 : 0,
+      });
+    }
+  }
+
+  draw() {
+    const gl = this.gl;
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(this.program);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vbuf);
+    const aPos = gl.getAttribLocation(this.program, "a_pos");
+    const aUv = gl.getAttribLocation(this.program, "a_uv");
+    gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(aUv);  gl.vertexAttribPointer(aUv,  2, gl.FLOAT, false, 16, 8);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.itemTex);
+    gl.uniform1i(gl.getUniformLocation(this.program, "u_item"), 0);
+    gl.uniform2f(gl.getUniformLocation(this.program, "u_itemSize"), this.itemW, this.itemH);
+
+    const n = this.regionTextures.length;
+    gl.uniform1i(gl.getUniformLocation(this.program, "u_nRegions"), n);
+
+    const dummy = this.regionTextures[0]?.fabric || this.itemTex;
+
+    // Three textures per region, starting at unit 1
+    for (let i = 0; i < MAX_REGIONS; i++) {
+      const r = this.regionTextures[i];
+      const fabricTex = r ? r.fabric : dummy;
+      const maskTex   = r ? r.mask   : dummy;
+      const lowTex    = r ? r.lowfreq: dummy;
+      const base = 1 + i * 3;
+      gl.activeTexture(gl.TEXTURE0 + base);
+      gl.bindTexture(gl.TEXTURE_2D, fabricTex);
+      gl.uniform1i(gl.getUniformLocation(this.program, `u_fabric${i}`), base);
+      gl.activeTexture(gl.TEXTURE0 + base + 1);
+      gl.bindTexture(gl.TEXTURE_2D, maskTex);
+      gl.uniform1i(gl.getUniformLocation(this.program, `u_mask${i}`), base + 1);
+      gl.activeTexture(gl.TEXTURE0 + base + 2);
+      gl.bindTexture(gl.TEXTURE_2D, lowTex);
+      gl.uniform1i(gl.getUniformLocation(this.program, `u_lowfreq${i}`), base + 2);
+
+      if (r) {
+        gl.uniform2f(gl.getUniformLocation(this.program, `u_fabricSize[${i}]`), r.fabricW, r.fabricH);
+        gl.uniform1f(gl.getUniformLocation(this.program, `u_scale[${i}]`), r.baseScale);
+        gl.uniform1f(gl.getUniformLocation(this.program, `u_scaleMult[${i}]`), r.scaleMult);
+        gl.uniform1f(gl.getUniformLocation(this.program, `u_rotation[${i}]`), r.rotation);
+        gl.uniform2f(gl.getUniformLocation(this.program, `u_offset[${i}]`), r.offsetX, r.offsetY);
+        gl.uniform1f(gl.getUniformLocation(this.program, `u_foldOn[${i}]`), r.foldOn);
+        gl.uniform1f(gl.getUniformLocation(this.program, `u_foldStrength[${i}]`), r.foldStrength);
+        gl.uniform1f(gl.getUniformLocation(this.program, `u_shadowsOnly[${i}]`), r.shadowsOnly);
+        gl.uniform1f(gl.getUniformLocation(this.program, `u_meanLum[${i}]`), r.meanLum);
+      }
+    }
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  updateRegion(i, patch) {
+    const r = this.regionTextures[i];
+    if (!r) return;
+    if (patch.rotation != null) r.rotation = patch.rotation * Math.PI / 180;
+    if (patch.offsetX != null) r.offsetX = patch.offsetX;
+    if (patch.offsetY != null) r.offsetY = patch.offsetY;
+    if (patch.scaleMult != null) r.scaleMult = patch.scaleMult;
+    if (patch.foldOn != null) r.foldOn = patch.foldOn ? 1 : 0;
+    if (patch.foldStrength != null) r.foldStrength = patch.foldStrength;
+    if (patch.shadowsOnly != null) r.shadowsOnly = patch.shadowsOnly ? 1 : 0;
+    this.draw();
+  }
+
+  exportPNG() { return new Promise(res => this.canvas.toBlob(res, "image/png")); }
+}
+
+// ============================================================
+// Pages
+// ============================================================
+route("/", (main) => {
+  const links = [
+    { h: "#/items", t: "Item Library", d: "Your sewn items" },
+    { h: "#/fabrics", t: "Fabric Library", d: "Your swatches" },
+    { h: "#/projects", t: "Projects", d: "Mockups & shortlists (Phase 5)" },
+    { h: "#/items/new", t: "+ New Item", d: "Upload, calibrate, crop" },
+    { h: "#/fabrics/new", t: "+ New Fabric", d: "Upload, calibrate, crop" },
+  ];
+  main.innerHTML = `
+    <div class="mx-auto max-w-2xl p-6">
+      <h1 class="mb-6 text-3xl font-semibold">FabricSwap</h1>
+      <div class="grid gap-3 sm:grid-cols-2">
+        ${links.map(l => `
+          <a href="${l.h}" class="rounded-xl border border-stone-200 bg-white p-4 shadow-sm hover:border-stone-400">
+            <div class="font-medium">${l.t}</div>
+            <div class="text-sm text-stone-500">${l.d}</div>
+          </a>`).join("")}
+      </div>
+      <p class="mt-6 text-xs text-stone-400">Phase 4 — fabric swap renderer live.</p>
+    </div>
+  `;
+});
+
+async function renderLibrary(main, { title, newHref, list, itemLink, kind }) {
+  main.innerHTML = `
+    <div class="mx-auto max-w-5xl p-6">
+      <div class="mb-4 flex items-center justify-between gap-3">
+        <h1 class="text-2xl font-semibold">${esc(title)}</h1>
+        <a href="${newHref}" class="rounded-lg bg-stone-900 px-3 py-2 text-sm font-medium text-white whitespace-nowrap">+ New</a>
+      </div>
+      <div class="mb-3 flex flex-wrap items-center gap-2">
+        <input type="search" placeholder="Search name or tag…" class="flex-1 min-w-[200px] rounded-md border border-stone-300 bg-white px-3 py-2 text-sm" data-search />
+        <select class="rounded-md border border-stone-300 bg-white px-3 py-2 text-sm" data-sort>
+          <option value="updated">Recently updated</option>
+          <option value="used">Recently used</option>
+          <option value="name">Name (A–Z)</option>
+          <option value="created">Date added (newest)</option>
+        </select>
+      </div>
+      <div class="mb-3 flex flex-wrap gap-1" data-tagfilter></div>
+      <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4" id="grid"></div>
+      <div class="mt-4 text-sm text-stone-500 hidden" data-empty>No ${kind} match your filters.</div>
+    </div>
+  `;
+  const search=main.querySelector("[data-search]"),sort=main.querySelector("[data-sort]"),tagFilter=main.querySelector("[data-tagfilter]"),grid=main.querySelector("#grid"),empty=main.querySelector("[data-empty]");
+  const all = await list(); let activeTag = null;
+  const applyFilters = () => {
+    const q=(search.value||"").trim().toLowerCase();
+    let filtered=all.filter(r=>{if(activeTag){if(!(r.tags||[]).some(t=>t.toLowerCase()===activeTag.toLowerCase()))return false;}if(!q)return true;if((r.name||"").toLowerCase().includes(q))return true;if((r.tags||[]).some(t=>t.toLowerCase().includes(q)))return true;return false;});
+    const mode=sort.value;
+    if(mode==="name")filtered.sort((a,b)=>(a.name||"").localeCompare(b.name||""));
+    else if(mode==="created")filtered.sort((a,b)=>b.createdAt-a.createdAt);
+    else if(mode==="used")filtered.sort((a,b)=>(b.lastUsedAt||0)-(a.lastUsedAt||0));
+    else filtered.sort((a,b)=>b.updatedAt-a.updatedAt);
+    renderGrid(filtered);
+  };
+  const renderGrid = async (records) => {
+    grid.innerHTML=""; empty.classList.toggle("hidden",records.length>0);
+    for(const r of records){
+      const url=await getBlobURL(r.imageBlobKey);
+      const extra=kind==="items"?`${(r.regions||[]).length} region${(r.regions||[]).length===1?'':'s'}`:"";
+      grid.appendChild(el(`
+        <a href="${itemLink(r)}" class="block overflow-hidden rounded-xl bg-white shadow-sm hover:shadow">
+          ${url?`<img src="${url}" class="aspect-square w-full object-cover" />`:`<div class="aspect-square w-full bg-stone-100"></div>`}
+          <div class="p-2">
+            <div class="truncate text-sm font-medium">${esc(r.name)}</div>
+            <div class="text-xs text-stone-500 truncate">${r.calibration?r.calibration.pixelsPerInch.toFixed(0)+" px/in":"no cal"}${extra?" · "+extra:""}</div>
+            ${(r.tags||[]).length?`<div class="mt-1 flex flex-wrap gap-1">${(r.tags||[]).slice(0,3).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}${(r.tags||[]).length>3?`<span class="text-[10px] text-stone-400">+${(r.tags||[]).length-3}</span>`:""}</div>`:""}
+          </div>
+        </a>
+      `));
+    }
+  };
+  const renderTagFilter = async () => {
+    const tags=await getAllTags(); const presentSet=new Set();
+    for(const r of all)for(const t of(r.tags||[]))presentSet.add(t.toLowerCase());
+    const present=tags.filter(t=>presentSet.has(t.toLowerCase()));
+    tagFilter.innerHTML=""; if(present.length===0)return;
+    present.forEach(t=>{const chip=el(`<button class="tag ${activeTag&&activeTag.toLowerCase()===t.toLowerCase()?'selected':''}">${esc(t)}</button>`);chip.addEventListener("click",()=>{if(activeTag&&activeTag.toLowerCase()===t.toLowerCase())activeTag=null;else activeTag=t;renderTagFilter();applyFilters();});tagFilter.appendChild(chip);});
+    if(activeTag){const clear=el(`<button class="tag">Clear filter ×</button>`);clear.addEventListener("click",()=>{activeTag=null;renderTagFilter();applyFilters();});tagFilter.appendChild(clear);}
+  };
+  search.addEventListener("input",applyFilters); sort.addEventListener("change",applyFilters);
+  renderTagFilter(); applyFilters();
+}
+
+route("/items",   (main) => renderLibrary(main, { title: "Item Library",   newHref: "#/items/new",   list: listItems,   itemLink: (r) => `#/items/${r.id}`,   kind: "items" }));
+route("/fabrics", (main) => renderLibrary(main, { title: "Fabric Library", newHref: "#/fabrics/new", list: listFabrics, itemLink: (r) => `#/fabrics/${r.id}`, kind: "fabrics" }));
+route("/projects", (main) => { main.innerHTML = `<div class="mx-auto max-w-2xl p-6"><h1 class="text-2xl font-semibold">Projects</h1><p class="mt-2 text-stone-500">Coming in Phase 5.</p></div>`; });
+
+function buildNewPage({ main, title, label, saveRecord, redirect }) {
+  main.innerHTML = `<div class="mx-auto max-w-2xl p-6"><h1 class="mb-4 text-2xl font-semibold">${esc(title)}</h1><div id="slot"></div></div>`;
+  const slot=main.querySelector("#slot"); let originalFile=null,currentDataUrl=null,currentCalibration=null,name="",tags=[];
+  const showUpload=()=>{slot.innerHTML="";slot.appendChild(ImageUpload((f,url)=>{originalFile=f;currentDataUrl=url;showCalibrate();},label));};
+  const showCalibrate=()=>{slot.innerHTML="";const wrap=el(`<div class="flex flex-col gap-4"><input type="text" placeholder="Name" value="${esc(name)}" class="w-full rounded-lg border border-stone-300 px-3 py-2" data-name /><div data-tags></div><div class="rounded-lg bg-white p-3 shadow-sm"><div class="mb-2 text-sm font-medium">Step 1 of 2 — Calibrate</div><div data-cal></div></div></div>`);wrap.querySelector("[data-name]").addEventListener("input",(e)=>(name=e.target.value));wrap.querySelector("[data-tags]").appendChild(TagEditor({initialTags:tags,onChange:(t)=>(tags=t)}));wrap.querySelector("[data-cal]").appendChild(CalibrateLine(currentDataUrl,(cal)=>{currentCalibration=cal;showCrop();},()=>{originalFile=null;currentDataUrl=null;currentCalibration=null;showUpload();}));slot.appendChild(wrap);};
+  const showCrop=()=>{slot.innerHTML="";const wrap=el(`<div class="flex flex-col gap-4"><input type="text" placeholder="Name" value="${esc(name)}" class="w-full rounded-lg border border-stone-300 px-3 py-2" data-name /><div data-tags></div><div class="rounded-lg bg-white p-3 shadow-sm"><div class="mb-2 text-sm font-medium">Step 2 of 2 — Crop (optional)</div><div data-crop></div></div></div>`);wrap.querySelector("[data-name]").addEventListener("input",(e)=>(name=e.target.value));wrap.querySelector("[data-tags]").appendChild(TagEditor({initialTags:tags,onChange:(t)=>(tags=t)}));const save=async(finalBlob)=>{const id=await saveRecord({blob:finalBlob,name,cal:currentCalibration,tags});navigate(redirect(id));};wrap.querySelector("[data-crop]").appendChild(CropTool(currentDataUrl,async(pxRect)=>{const{blob}=await cropImageToBlob(currentDataUrl,pxRect);await save(blob);},async()=>{await save(originalFile);},()=>{showCalibrate();}));slot.appendChild(wrap);};
+  showUpload();
+}
+route("/items/new",(main)=>{buildNewPage({main,title:"New Item",label:"Upload a flat-lay photo of your item",redirect:(id)=>`#/items/${id}`,saveRecord:async({blob,name,cal,tags})=>{const id=uid(),key=`item-${id}-original`;await putBlob(key,blob);const now=Date.now();await putItem({id,name:name||"Untitled item",tags:dedupeTags(tags||[]),imageBlobKey:key,thumbBlobKey:null,calibration:cal,regions:[],itemType:null,createdAt:now,updatedAt:now,lastUsedAt:now});return id;}});});
+route("/fabrics/new",(main)=>{buildNewPage({main,title:"New Fabric",label:"Upload a tileable fabric swatch",redirect:(id)=>`#/fabrics/${id}`,saveRecord:async({blob,name,cal,tags})=>{const id=uid(),key=`fabric-${id}-original`;await putBlob(key,blob);const now=Date.now();await putFabric({id,name:name||"Untitled fabric",tags:dedupeTags(tags||[]),imageBlobKey:key,thumbBlobKey:null,calibration:cal,isTileable:true,createdAt:now,updatedAt:now,lastUsedAt:now});return id;}});});
+
+// Item detail (adds "Try fabrics" button)
+route("/items/:id", async (main, { id }) => {
+  const item = await getItem(id);
+  if (!item) { main.innerHTML = `<div class="p-6">Item not found. <a class="underline" href="#/items">Back</a></div>`; return; }
+  const imgUrl = await getBlobURL(item.imageBlobKey);
+  const canTry = (item.regions || []).length > 0 && item.calibration;
+  main.innerHTML = `
+    <div class="mx-auto max-w-3xl p-6">
+      <div class="mb-4 flex items-center justify-between gap-3">
+        <input class="flex-1 min-w-0 rounded-md border border-transparent bg-transparent px-2 py-1 text-2xl font-semibold hover:border-stone-200 focus:border-stone-300 focus:bg-white outline-none" value="${esc(item.name)}" data-name />
+        <div class="flex gap-2">
+<a href="#/items/${item.id}/segment" class="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium whitespace-nowrap">
+  ${(item.regions||[]).length ? "Edit regions" : "Segment (SAM)"}
+</a>
+<a href="#/items/${item.id}/manual-region" class="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium whitespace-nowrap">
+  + Manual region
+</a>
+${canTry ? `<a href="#/items/${item.id}/try" class="rounded-lg bg-stone-900 px-3 py-2 text-sm font-medium text-white whitespace-nowrap">Try fabrics</a>` : ""}
+        </div>
+      </div>
+      <div class="mb-3" data-tags></div>
+      <div class="seg-stage mx-auto">
+        <img src="${imgUrl}" />
+        <canvas class="seg-canvas-overlay"></canvas>
+      </div>
+      <div class="mt-4 rounded-xl bg-white p-4 shadow-sm">
+        <div class="text-sm font-medium mb-2">Regions (${(item.regions||[]).length})</div>
+        <div id="regions-list" class="flex flex-col gap-2"></div>
+      </div>
+      <div class="mt-4 flex items-center justify-between text-xs text-stone-500">
+        <div>Calibration: ${item.calibration?item.calibration.pixelsPerInch.toFixed(1)+" px/in ("+item.calibration.orientation+")":"none"}</div>
+        <button class="rounded-md border border-red-200 bg-white px-2 py-1 text-xs text-red-600 hover:bg-red-50" data-delete>Delete item</button>
+      </div>
+    </div>
+  `;
+  const nameInput=main.querySelector("[data-name]"),stageImg=main.querySelector(".seg-stage img"),overlay=main.querySelector(".seg-canvas-overlay"),regionsList=main.querySelector("#regions-list");
+  nameInput.addEventListener("change",async()=>{item.name=nameInput.value.trim()||"Untitled item";item.updatedAt=Date.now();await putItem(item);});
+  main.querySelector("[data-tags]").appendChild(TagEditor({initialTags:item.tags||[],onChange:async(t)=>{item.tags=dedupeTags(t);item.updatedAt=Date.now();await putItem(item);}}));
+  main.querySelector("[data-delete]").addEventListener("click",async()=>{if(!confirm(`Delete "${item.name}" and all its regions? This cannot be undone.`))return;await deleteItemCascade(item.id);navigate("#/items");});
+  const paintOverlay=async()=>{const r=stageImg.getBoundingClientRect();overlay.width=r.width*devicePixelRatio;overlay.height=r.height*devicePixelRatio;overlay.style.width=r.width+"px";overlay.style.height=r.height+"px";const ctx=overlay.getContext("2d");ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);ctx.clearRect(0,0,r.width,r.height);const colors=["#ea580c","#2563eb","#16a34a","#9333ea","#db2777","#ca8a04"];const regs=item.regions||[];for(let i=0;i<regs.length;i++){const reg=regs[i];const mb=await getBlob(reg.maskBlobKey);if(!mb)continue;const url=URL.createObjectURL(mb);const mimg=new Image();await new Promise(res=>{mimg.onload=res;mimg.src=url;});const tmp=document.createElement("canvas");tmp.width=mimg.naturalWidth;tmp.height=mimg.naturalHeight;const tctx=tmp.getContext("2d");tctx.drawImage(mimg,0,0);const id=tctx.getImageData(0,0,tmp.width,tmp.height);const col=hexToRgb(colors[i%colors.length]);for(let p=0;p<id.data.length;p+=4){if(id.data[p]>128){id.data[p]=col.r;id.data[p+1]=col.g;id.data[p+2]=col.b;id.data[p+3]=110;}else id.data[p+3]=0;}tctx.putImageData(id,0,0);ctx.drawImage(tmp,0,0,r.width,r.height);URL.revokeObjectURL(url);}};
+  const renderList=()=>{const regs=item.regions||[];const colors=["#ea580c","#2563eb","#16a34a","#9333ea","#db2777","#ca8a04"];if(regs.length===0){regionsList.innerHTML=`<div class="text-sm text-stone-500">No regions yet.</div>`;return;}regionsList.innerHTML="";regs.forEach((reg,i)=>{regionsList.appendChild(el(`<div class="flex items-center gap-3"><div class="region-swatch" style="background:${colors[i%colors.length]}"></div><div class="flex-1 truncate text-sm">${esc(reg.label||`Region ${i+1}`)}</div><div class="text-xs text-stone-500">${reg.role||""}</div></div>`));});};
+  stageImg.addEventListener("load",paintOverlay); if(stageImg.complete&&stageImg.naturalWidth)paintOverlay();
+  window.addEventListener("resize",paintOverlay); renderList();
+});
+
+// Fabric detail (unchanged)
+route("/fabrics/:id", async (main, { id }) => {
+  const fabric = await getFabric(id);
+  if (!fabric) { main.innerHTML = `<div class="p-6">Fabric not found. <a class="underline" href="#/fabrics">Back</a></div>`; return; }
+  const imgUrl = await getBlobURL(fabric.imageBlobKey);
+  main.innerHTML = `
+    <div class="mx-auto max-w-3xl p-6">
+      <div class="mb-4 flex items-center justify-between gap-3">
+        <input class="flex-1 min-w-0 rounded-md border border-transparent bg-transparent px-2 py-1 text-2xl font-semibold hover:border-stone-200 focus:border-stone-300 focus:bg-white outline-none" value="${esc(fabric.name)}" data-name />
+      </div>
+      <div class="mb-3" data-tags></div>
+      <img src="${imgUrl}" class="w-full rounded-xl shadow-sm" />
+      <div class="mt-4 rounded-xl bg-white p-4 shadow-sm text-sm">
+        <div class="font-medium mb-2">Details</div>
+        <div class="grid grid-cols-2 gap-y-1 text-stone-700">
+          <div class="text-stone-500">Calibration</div><div>${fabric.calibration?`${fabric.calibration.pixelsPerInch.toFixed(1)} px/in (${fabric.calibration.orientation})`:"none"}</div>
+          <div class="text-stone-500">Real-world ref</div><div>${fabric.calibration?`${fabric.calibration.realWorldInches}"`:"—"}</div>
+          <div class="text-stone-500">Added</div><div>${new Date(fabric.createdAt).toLocaleDateString()}</div>
+          <div class="text-stone-500">Last used</div><div>${fabric.lastUsedAt?new Date(fabric.lastUsedAt).toLocaleDateString():"never"}</div>
+        </div>
+      </div>
+      <div class="mt-4 flex items-center justify-end">
+        <button class="rounded-md border border-red-200 bg-white px-2 py-1 text-xs text-red-600 hover:bg-red-50" data-delete>Delete fabric</button>
+      </div>
+    </div>
+  `;
+  const nameInput=main.querySelector("[data-name]");
+  nameInput.addEventListener("change",async()=>{fabric.name=nameInput.value.trim()||"Untitled fabric";fabric.updatedAt=Date.now();await putFabric(fabric);});
+  main.querySelector("[data-tags]").appendChild(TagEditor({initialTags:fabric.tags||[],onChange:async(t)=>{fabric.tags=dedupeTags(t);fabric.updatedAt=Date.now();await putFabric(fabric);}}));
+  main.querySelector("[data-delete]").addEventListener("click",async()=>{if(!confirm(`Delete "${fabric.name}"? This cannot be undone.`))return;await deleteFabricCascade(fabric.id);navigate("#/fabrics");});
+});
+
+// Segment page (unchanged from Phase 2/3)
+route("/items/:id/segment", async (main, { id }) => {
+  const item = await getItem(id);
+  if (!item) { main.innerHTML = `<div class="p-6">Item not found.</div>`; return; }
+  const imgUrl = await getBlobURL(item.imageBlobKey);
+  const { img } = await loadImage(imgUrl);
+  main.innerHTML = `
+    <div class="mx-auto max-w-4xl p-6">
+      <div class="mb-4 flex items-center justify-between gap-3">
+        <h1 class="text-2xl font-semibold truncate">Segment · ${esc(item.name)}</h1>
+        <a href="#/items/${item.id}" class="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium">Done</a>
+      </div>
+      <div id="loader" class="rounded-xl bg-white p-4 shadow-sm">
+        <div class="text-sm font-medium" data-stage>Preparing…</div>
+        <div class="mt-2 h-2 w-full overflow-hidden rounded bg-stone-200"><div class="h-full bg-stone-900 transition-all" data-bar style="width:0%"></div></div>
+        <div class="mt-1 text-xs text-stone-500" data-detail></div>
+      </div>
+      <div id="segUI" class="hidden mt-4 grid gap-4 md:grid-cols-[1fr_280px]">
+        <div>
+          <div class="seg-stage">
+            <img data-img src="${imgUrl}" />
+            <canvas class="seg-canvas-overlay" data-overlay></canvas>
+            <div class="seg-click-layer" data-click></div>
+          </div>
+          <p class="mt-2 text-xs text-stone-500">Tap a fabric to generate a mask. Shift-click to add positive, Alt-click for negative. Confirm to save.</p>
+        </div>
+        <div class="flex flex-col gap-3">
+          <div class="rounded-xl bg-white p-3 shadow-sm">
+            <div class="mb-2 text-sm font-medium">Pending mask</div>
+            <div id="pending" class="text-xs text-stone-500">Tap the image to start.</div>
+            <div id="pendingActions" class="mt-3 hidden flex-col gap-2">
+              <input type="text" placeholder="Label (e.g., exterior, loop)" class="rounded-md border border-stone-300 px-2 py-1 text-sm" data-label />
+              <select class="rounded-md border border-stone-300 px-2 py-1 text-sm" data-role>
+                <option value="">Role (optional)</option><option>loop</option><option>tail</option><option>knot</option><option>center</option><option>exterior</option><option>lining</option><option>contrast</option>
+              </select>
+              <div class="flex gap-2">
+                <button class="flex-1 rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium" data-discard>Discard</button>
+                <button class="flex-1 rounded-lg bg-stone-900 px-3 py-2 text-sm font-medium text-white" data-confirm>Add region</button>
+              </div>
+            </div>
+          </div>
+          <div class="rounded-xl bg-white p-3 shadow-sm">
+            <div class="mb-2 text-sm font-medium">Saved regions</div>
+            <div id="savedList" class="flex flex-col gap-2 text-sm"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  const loader=main.querySelector("#loader"),loaderStage=main.querySelector("[data-stage]"),loaderBar=main.querySelector("[data-bar]"),loaderDetail=main.querySelector("[data-detail]"),segUI=main.querySelector("#segUI");
+  const setProgress=({stage,pct,loaded,total})=>{loaderStage.textContent=stage;loaderBar.style.width=`${Math.round((pct||0)*100)}%`;if(loaded&&total)loaderDetail.textContent=`${(loaded/1e6).toFixed(1)} / ${(total/1e6).toFixed(1)} MB`;else loaderDetail.textContent="";};
+  try{await loadSAM((p)=>setProgress({stage:p.stage,pct:p.pct}));}catch(e){loader.innerHTML=`<div class="text-sm text-red-600">Failed to load model: ${esc(e.message||e)}</div>`;return;}
+  setProgress({stage:"Analyzing image…",pct:0.5});
+  let embPlain=await getEmbedding(id),meta;
+  if(!embPlain){const{embedding,meta:m}=await runEncoder(img);meta=m;const packed={tensor:tensorToPlain(embedding),meta};await putEmbedding(id,packed);embPlain=packed;}else meta=embPlain.meta;
+  const embedding=plainToTensor(embPlain.tensor);
+  setProgress({stage:"Ready",pct:1}); loader.classList.add("hidden"); segUI.classList.remove("hidden");
+  const stageImg=main.querySelector("[data-img]"),overlay=main.querySelector("[data-overlay]"),click=main.querySelector("[data-click]"),pendingEl=main.querySelector("#pending"),pendingActions=main.querySelector("#pendingActions"),labelInput=main.querySelector("[data-label]"),roleSelect=main.querySelector("[data-role]"),savedList=main.querySelector("#savedList");
+  let points=[],pendingMaskCanvas=null;
+  const resizeOverlay=()=>{const r=stageImg.getBoundingClientRect();overlay.width=r.width*devicePixelRatio;overlay.height=r.height*devicePixelRatio;overlay.style.width=r.width+"px";overlay.style.height=r.height+"px";repaint();};
+  const repaint=()=>{const r=stageImg.getBoundingClientRect();const ctx=overlay.getContext("2d");ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);ctx.clearRect(0,0,r.width,r.height);paintSavedRegions(ctx,r);if(pendingMaskCanvas){const tmp=document.createElement("canvas");tmp.width=pendingMaskCanvas.width;tmp.height=pendingMaskCanvas.height;const tctx=tmp.getContext("2d");tctx.drawImage(pendingMaskCanvas,0,0);const id=tctx.getImageData(0,0,tmp.width,tmp.height);for(let p=0;p<id.data.length;p+=4){if(id.data[p]>128){id.data[p]=234;id.data[p+1]=88;id.data[p+2]=12;id.data[p+3]=140;}else id.data[p+3]=0;}tctx.putImageData(id,0,0);ctx.drawImage(tmp,0,0,r.width,r.height);}for(const pt of points){const dx=(pt.x/meta.srcW)*r.width,dy=(pt.y/meta.srcH)*r.height;ctx.beginPath();ctx.arc(dx,dy,6,0,Math.PI*2);ctx.fillStyle=pt.label===1?"rgb(34,197,94)":"rgb(239,68,68)";ctx.fill();ctx.lineWidth=2;ctx.strokeStyle="white";ctx.stroke();}};
+  async function paintSavedRegions(ctx,r){const colors=["#2563eb","#16a34a","#9333ea","#db2777","#ca8a04","#0891b2"];const regs=item.regions||[];for(let i=0;i<regs.length;i++){const reg=regs[i];const blob=await getBlob(reg.maskBlobKey);if(!blob)continue;const url=URL.createObjectURL(blob);const mimg=new Image();await new Promise(res=>{mimg.onload=res;mimg.src=url;});const tmp=document.createElement("canvas");tmp.width=mimg.naturalWidth;tmp.height=mimg.naturalHeight;const tctx=tmp.getContext("2d");tctx.drawImage(mimg,0,0);const id=tctx.getImageData(0,0,tmp.width,tmp.height);const col=hexToRgb(colors[i%colors.length]);for(let p=0;p<id.data.length;p+=4){if(id.data[p]>128){id.data[p]=col.r;id.data[p+1]=col.g;id.data[p+2]=col.b;id.data[p+3]=90;}else id.data[p+3]=0;}tctx.putImageData(id,0,0);ctx.drawImage(tmp,0,0,r.width,r.height);URL.revokeObjectURL(url);}}
+  const renderSaved=()=>{const regs=item.regions||[];const colors=["#2563eb","#16a34a","#9333ea","#db2777","#ca8a04","#0891b2"];if(regs.length===0){savedList.innerHTML=`<div class="text-xs text-stone-500">None yet.</div>`;return;}savedList.innerHTML="";regs.forEach((reg,i)=>{const row=el(`<div class="flex items-center gap-2"><div class="region-swatch" style="background:${colors[i%colors.length]}"></div><input class="flex-1 rounded-md border border-stone-200 px-2 py-1 text-sm" value="${esc(reg.label||`Region ${i+1}`)}" data-rename /><button class="rounded-md border border-stone-300 px-2 py-1 text-xs" data-del>✕</button></div>`);row.querySelector("[data-rename]").addEventListener("change",async(e)=>{reg.label=e.target.value;item.updatedAt=Date.now();await putItem(item);});row.querySelector("[data-del]").addEventListener("click",async()=>{if(!confirm("Delete this region?"))return;await delBlob(reg.maskBlobKey);item.regions=item.regions.filter(r=>r.id!==reg.id);item.updatedAt=Date.now();await putItem(item);renderSaved();repaint();});savedList.appendChild(row);});};
+  async function recomputePending(){if(points.length===0){pendingMaskCanvas=null;pendingEl.textContent="Tap the image to start.";pendingActions.classList.add("hidden");pendingActions.classList.remove("flex");repaint();return;}pendingEl.textContent="Generating mask…";const{masks,iou}=await runDecoder(embedding,meta,points);const{canvas,score}=await masksToBestMaskImage(masks,iou,meta);pendingMaskCanvas=canvas;pendingEl.textContent=`Mask ready (confidence ${(score*100).toFixed(0)}%). Shift-click to refine.`;pendingActions.classList.remove("hidden");pendingActions.classList.add("flex");repaint();}
+  click.addEventListener("pointerdown",async(e)=>{e.preventDefault();const r=stageImg.getBoundingClientRect();const nx=(e.clientX-r.left)/r.width,ny=(e.clientY-r.top)/r.height;const x=nx*meta.srcW,y=ny*meta.srcH;const positive=!e.altKey;if(e.shiftKey||e.altKey)points.push({x,y,label:positive?1:0});else points=[{x,y,label:1}];await recomputePending();});
+  main.querySelector("[data-discard]").addEventListener("click",()=>{points=[];pendingMaskCanvas=null;labelInput.value="";roleSelect.value="";recomputePending();});
+  main.querySelector("[data-confirm]").addEventListener("click",async()=>{if(!pendingMaskCanvas)return;const blob=await new Promise(res=>pendingMaskCanvas.toBlob(res,"image/png"));const regionId=uid();const maskKey=`item-${item.id}-mask-${regionId}`;await putBlob(maskKey,blob);const ctx=pendingMaskCanvas.getContext("2d");const id=ctx.getImageData(0,0,pendingMaskCanvas.width,pendingMaskCanvas.height);let minX=pendingMaskCanvas.width,minY=pendingMaskCanvas.height,maxX=0,maxY=0,area=0;for(let y=0;y<pendingMaskCanvas.height;y++)for(let x=0;x<pendingMaskCanvas.width;x++){if(id.data[(y*pendingMaskCanvas.width+x)*4]>128){if(x<minX)minX=x;if(y<minY)minY=y;if(x>maxX)maxX=x;if(y>maxY)maxY=y;area++;}}const bbox=area>0?[minX,minY,maxX-minX,maxY-minY]:[0,0,0,0];const region={id:regionId,label:labelInput.value.trim()||`Region ${(item.regions||[]).length+1}`,maskBlobKey:maskKey,bbox,areaPx:area,role:roleSelect.value||null};item.regions=[...(item.regions||[]),region];item.updatedAt=Date.now();await putItem(item);points=[];pendingMaskCanvas=null;labelInput.value="";roleSelect.value="";renderSaved();recomputePending();});
+  stageImg.addEventListener("load",resizeOverlay); if(stageImg.complete&&stageImg.naturalWidth)resizeOverlay();
+  window.addEventListener("resize",resizeOverlay); renderSaved();
+});
+// ============================================================
+// Manual region (rectangle or polygon) — alternative to SAM
+// ============================================================
+route("/items/:id/manual-region", async (main, { id }) => {
+  const item = await getItem(id);
+  if (!item) { main.innerHTML = `<div class="p-6">Item not found.</div>`; return; }
+  const imgUrl = await getBlobURL(item.imageBlobKey);
+  const { img: itemImg } = await loadImage(imgUrl);
+
+  main.innerHTML = `
+    <div class="mx-auto max-w-4xl p-6">
+      <div class="mb-4 flex items-center justify-between gap-3">
+        <h1 class="text-2xl font-semibold truncate">Manual region · ${esc(item.name)}</h1>
+        <a href="#/items/${item.id}" class="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium">Cancel</a>
+      </div>
+      <div class="mb-3 flex gap-2">
+        <button class="flex-1 rounded-lg px-3 py-2 text-sm font-medium border" data-mode="rect">Rectangle</button>
+        <button class="flex-1 rounded-lg px-3 py-2 text-sm font-medium border" data-mode="poly">Polygon</button>
+      </div>
+      <div class="relative mx-auto select-none touch-none" data-stage style="display:inline-block;max-width:100%">
+        <img data-img src="${imgUrl}" class="block max-w-full rounded-xl" draggable="false" />
+        <svg class="pointer-events-none absolute inset-0 h-full w-full" data-svg></svg>
+        <div class="absolute inset-0" data-click style="cursor:crosshair"></div>
+      </div>
+      <p class="mt-2 text-xs text-stone-500" data-hint></p>
+      <div class="mt-4 rounded-xl bg-white p-3 shadow-sm">
+        <div class="flex flex-col gap-2">
+          <input type="text" placeholder="Label (e.g., exterior, loop)" class="rounded-md border border-stone-300 px-2 py-1 text-sm" data-label />
+          <select class="rounded-md border border-stone-300 px-2 py-1 text-sm" data-role>
+            <option value="">Role (optional)</option>
+            <option>loop</option><option>tail</option><option>knot</option><option>center</option>
+            <option>exterior</option><option>lining</option><option>contrast</option>
+          </select>
+          <div class="flex gap-2">
+            <button class="flex-1 rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium" data-reset>Reset</button>
+            <button class="flex-1 rounded-lg bg-stone-900 px-3 py-2 text-sm font-medium text-white" data-save>Save region</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const stage = main.querySelector("[data-stage]");
+  const imgEl = main.querySelector("[data-img]");
+  const svg = main.querySelector("[data-svg]");
+  const clickLayer = main.querySelector("[data-click]");
+  const hint = main.querySelector("[data-hint]");
+  const modeRectBtn = main.querySelector('[data-mode="rect"]');
+  const modePolyBtn = main.querySelector('[data-mode="poly"]');
+
+  let mode = "rect";
+  // Rect state (normalized 0..1 in image space)
+  let rect = null; // { x, y, w, h }
+  let rectDrag = null;
+  // Polygon state (normalized points 0..1)
+  let polyPoints = [];
+  let polyClosed = false;
+
+  const updateModeButtons = () => {
+    const active = "bg-stone-900 text-white border-stone-900";
+    const inactive = "bg-white text-stone-700 border-stone-300";
+    modeRectBtn.className = `flex-1 rounded-lg px-3 py-2 text-sm font-medium border ${mode==='rect'?active:inactive}`;
+    modePolyBtn.className = `flex-1 rounded-lg px-3 py-2 text-sm font-medium border ${mode==='poly'?active:inactive}`;
+    hint.textContent = mode === "rect"
+      ? "Drag to draw a rectangle. Drag again to redraw."
+      : "Tap to add points. Click the first point (or press Enter) to close. Right-click or press Backspace to undo.";
+  };
+
+  const resetShape = () => {
+    rect = null; polyPoints = []; polyClosed = false; redraw();
+  };
+
+  const setMode = (m) => { mode = m; resetShape(); updateModeButtons(); };
+  modeRectBtn.addEventListener("click", () => setMode("rect"));
+  modePolyBtn.addEventListener("click", () => setMode("poly"));
+
+  const redraw = () => {
+    const r = imgEl.getBoundingClientRect();
+    svg.setAttribute("viewBox", `0 0 ${r.width} ${r.height}`);
+    let html = "";
+    if (mode === "rect" && rect) {
+      const x = rect.x * r.width, y = rect.y * r.height, w = rect.w * r.width, h = rect.h * r.height;
+      html += `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="rgba(234,88,12,0.25)" stroke="rgb(234,88,12)" stroke-width="2"/>`;
+    } else if (mode === "poly" && polyPoints.length > 0) {
+      const pts = polyPoints.map(p => `${p.x * r.width},${p.y * r.height}`).join(" ");
+      if (polyClosed || polyPoints.length >= 3) {
+        html += `<polygon points="${pts}" fill="rgba(234,88,12,0.25)" stroke="rgb(234,88,12)" stroke-width="2"/>`;
+      } else {
+        html += `<polyline points="${pts}" fill="none" stroke="rgb(234,88,12)" stroke-width="2"/>`;
+      }
+      // Points
+      for (let i = 0; i < polyPoints.length; i++) {
+        const p = polyPoints[i];
+        const cx = p.x * r.width, cy = p.y * r.height;
+        const first = i === 0;
+        html += `<circle cx="${cx}" cy="${cy}" r="${first ? 7 : 5}" fill="white" stroke="rgb(234,88,12)" stroke-width="2"/>`;
+      }
+    }
+    svg.innerHTML = html;
+  };
+  window.addEventListener("resize", redraw);
+  imgEl.addEventListener("load", redraw);
+  if (imgEl.complete && imgEl.naturalWidth) redraw();
+
+  // Rectangle: pointer drag to draw
+  clickLayer.addEventListener("pointerdown", (e) => {
+    const r = imgEl.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width;
+    const y = (e.clientY - r.top) / r.height;
+    if (mode === "rect") {
+      e.preventDefault();
+      rectDrag = { startX: x, startY: y };
+      rect = { x, y, w: 0, h: 0 };
+      redraw();
+    } else {
+      // Polygon: tap to add point, tap near first point to close
+      if (polyClosed) return;
+      if (polyPoints.length >= 3) {
+        const first = polyPoints[0];
+        const dx = (x - first.x) * r.width, dy = (y - first.y) * r.height;
+        if (Math.hypot(dx, dy) < 14) {
+          polyClosed = true; redraw(); return;
+        }
+      }
+      polyPoints.push({ x, y });
+      redraw();
+    }
+  });
+  clickLayer.addEventListener("pointermove", (e) => {
+    if (mode !== "rect" || !rectDrag) return;
+    const r = imgEl.getBoundingClientRect();
+    const x = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+    const y = Math.max(0, Math.min(1, (e.clientY - r.top) / r.height));
+    const nx = Math.min(rectDrag.startX, x);
+    const ny = Math.min(rectDrag.startY, y);
+    rect = { x: nx, y: ny, w: Math.abs(x - rectDrag.startX), h: Math.abs(y - rectDrag.startY) };
+    redraw();
+  });
+  const endRectDrag = () => (rectDrag = null);
+  window.addEventListener("pointerup", endRectDrag);
+  window.addEventListener("pointercancel", endRectDrag);
+
+  // Right-click: undo last polygon point
+  clickLayer.addEventListener("contextmenu", (e) => {
+    if (mode !== "poly") return;
+    e.preventDefault();
+    if (polyClosed) polyClosed = false;
+    else polyPoints.pop();
+    redraw();
+  });
+  // Keyboard: Enter closes polygon, Backspace undoes
+  const keyHandler = (e) => {
+    if (mode !== "poly") return;
+    if (e.key === "Enter" && polyPoints.length >= 3) { polyClosed = true; redraw(); }
+    else if (e.key === "Backspace") { if (polyClosed) polyClosed = false; else polyPoints.pop(); redraw(); }
+  };
+  window.addEventListener("keydown", keyHandler);
+
+  main.querySelector("[data-reset]").addEventListener("click", resetShape);
+
+  main.querySelector("[data-save]").addEventListener("click", async () => {
+    // Rasterize current shape to a mask canvas at full item resolution
+    const w = itemImg.naturalWidth, h = itemImg.naturalHeight;
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "black"; ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = "white";
+
+    let ok = false;
+    if (mode === "rect" && rect && rect.w > 0.005 && rect.h > 0.005) {
+      ctx.fillRect(rect.x * w, rect.y * h, rect.w * w, rect.h * h);
+      ok = true;
+    } else if (mode === "poly" && polyPoints.length >= 3) {
+      // Close automatically if user hit save without closing
+      ctx.beginPath();
+      polyPoints.forEach((p, i) => {
+        const px = p.x * w, py = p.y * h;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      });
+      ctx.closePath(); ctx.fill();
+      ok = true;
+    }
+    if (!ok) { alert("Draw a shape first."); return; }
+
+    // Compute bbox and area
+    const id = ctx.getImageData(0, 0, w, h);
+    let minX = w, minY = h, maxX = 0, maxY = 0, area = 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (id.data[(y*w + x)*4] > 128) {
+          if (x < minX) minX = x; if (y < minY) minY = y;
+          if (x > maxX) maxX = x; if (y > maxY) maxY = y;
+          area++;
+        }
+      }
+    }
+    const bbox = area > 0 ? [minX, minY, maxX - minX, maxY - minY] : [0,0,0,0];
+
+    const blob = await new Promise(res => canvas.toBlob(res, "image/png"));
+    const regionId = uid();
+    const maskKey = `item-${item.id}-mask-${regionId}`;
+    await putBlob(maskKey, blob);
+
+    const labelInput = main.querySelector("[data-label]");
+    const roleSelect = main.querySelector("[data-role]");
+    const region = {
+      id: regionId,
+      label: labelInput.value.trim() || `Region ${(item.regions||[]).length + 1}`,
+      maskBlobKey: maskKey,
+      bbox, areaPx: area,
+      role: roleSelect.value || null,
+    };
+    item.regions = [...(item.regions||[]), region];
+    item.updatedAt = Date.now();
+    await putItem(item);
+    window.removeEventListener("keydown", keyHandler);
+    navigate(`#/items/${item.id}`);
+  });
+
+  updateModeButtons();
+});
+
+// ============================================================
+// PHASE 4 — Try fabric page
+// ============================================================
+route("/items/:id/try", async (main, { id }) => {
+  const item = await getItem(id);
+  if (!item) { main.innerHTML = `<div class="p-6">Item not found.</div>`; return; }
+  if (!item.calibration) { main.innerHTML = `<div class="p-6">Item has no calibration.</div>`; return; }
+  if (!(item.regions || []).length) { main.innerHTML = `<div class="p-6">Item has no regions. Segment it first.</div>`; return; }
+
+  const imgUrl = await getBlobURL(item.imageBlobKey);
+  const { img: itemImg } = await loadImage(imgUrl);
+  const fabrics = await listFabrics();
+
+  main.innerHTML = `
+    <div class="mx-auto max-w-6xl p-6">
+      <div class="mb-4 flex items-center justify-between gap-3">
+        <h1 class="text-2xl font-semibold truncate">Try fabrics · ${esc(item.name)}</h1>
+        <div class="flex gap-2">
+          <button class="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium" data-export>Export PNG</button>
+          <a href="#/items/${item.id}" class="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium">Done</a>
+        </div>
+      </div>
+      <div class="grid gap-4 md:grid-cols-[1fr_340px]">
+        <div class="try-stage">
+          <canvas data-canvas></canvas>
+        </div>
+        <div class="flex flex-col gap-3" data-sidebar></div>
+      </div>
+      ${fabrics.length === 0 ? `<div class="mt-4 rounded-md bg-amber-50 p-3 text-sm text-amber-800">You don't have any fabrics yet. <a href="#/fabrics/new" class="underline font-medium">Add one</a> to start swapping.</div>` : ""}
+    </div>
+  `;
+
+  const canvas = main.querySelector("[data-canvas]");
+  const sidebar = main.querySelector("[data-sidebar]");
+  const renderer = new FabricSwapRenderer(canvas);
+  renderer.setItem(itemImg);
+
+  // Precompute per-item-region data (mean luminance + feathered mask image)
+  const regionData = [];
+  for (const reg of item.regions) {
+    const maskBlob = await getBlob(reg.maskBlobKey);
+    const maskUrl = URL.createObjectURL(maskBlob);
+    const { img: maskImg } = await loadImage(maskUrl);
+    // Feather the mask for soft edges
+    const feathered = featherMask(maskImg, 1.5);
+    const fblob = await new Promise(res => feathered.toBlob(res, "image/png"));
+    const fUrl = URL.createObjectURL(fblob);
+    const { img: fimg } = await loadImage(fUrl);
+    // Build low-frequency lighting map for this region
+    const bbox = maskBoundingBox(maskImg);
+    const lowFreqCanvas = buildLowFreqLighting(itemImg, bbox);
+    const lowFreqMean = computeLowFreqMean(lowFreqCanvas, maskImg);
+    regionData.push({
+      featheredImg: fimg,
+      lowFreqCanvas,
+      lowFreqMean,
+      label: reg.label || `Region ${regionData.length+1}`,
+    });
+    URL.revokeObjectURL(maskUrl);
+    URL.revokeObjectURL(fUrl);
+  }
+
+  // Per-region assignment state (one fabric + transform per region)
+const assignments = item.regions.map(() => ({
+    fabricId: null,
+    rotation: 0,
+    offsetX: 0,
+    offsetY: 0,
+    scaleMult: 1,
+    foldOn: true,
+    foldStrength: 0.8,
+    shadowsOnly: false,
+    fabricImg: null,
+  }));
+
+  const colors = ["#ea580c","#2563eb","#16a34a","#9333ea","#db2777","#ca8a04"];
+
+  const rebuildRegionsForRenderer = async () => {
+    const list = [];
+    for (let i = 0; i < item.regions.length; i++) {
+      const a = assignments[i];
+      if (!a.fabricId || !a.fabricImg) continue;
+      const fabric = fabrics.find(f => f.id === a.fabricId);
+      list.push({
+        fabricImg: a.fabricImg,
+        maskImg: regionData[i].featheredImg,
+        lowFreqCanvas: regionData[i].lowFreqCanvas,
+        lowFreqMean: regionData[i].lowFreqMean,
+        fabricPPI: fabric.calibration.pixelsPerInch,
+        itemPPI: item.calibration.pixelsPerInch,
+        rotation: a.rotation,
+        offsetX: a.offsetX,
+        offsetY: a.offsetY,
+        scaleMult: a.scaleMult,
+        foldOn: a.foldOn,
+        foldStrength: a.foldStrength,
+        shadowsOnly: a.shadowsOnly,
+      });
+    }
+    await renderer.setRegions(list);
+    renderer.draw();
+  };
+
+ const renderSidebar = () => {
+    sidebar.innerHTML = "";
+    item.regions.forEach((reg, i) => {
+      const a = assignments[i];
+      const panel = el(`
+        <div class="rounded-xl bg-white p-3 shadow-sm">
+          <div class="mb-2 flex items-center gap-2">
+            <div class="region-swatch" style="background:${colors[i % colors.length]}"></div>
+            <div class="text-sm font-medium flex-1 truncate">${esc(reg.label || `Region ${i+1}`)}</div>
+            ${reg.role ? `<span class="text-xs text-stone-500">${esc(reg.role)}</span>` : ""}
+          </div>
+          <div class="mb-2 text-xs font-medium text-stone-600">Fabric</div>
+          <div class="mb-3 flex flex-wrap gap-1" data-fabrics></div>
+          <div class="flex flex-col gap-2" data-controls></div>
+          <div class="mt-3 rounded-md border border-stone-200 p-2">
+            <label class="flex items-center gap-2 text-sm">
+              <input type="checkbox" ${a.foldOn ? "checked" : ""} data-foldon />
+              <span>Transfer folds from original</span>
+            </label>
+            <div class="mt-2 flex flex-col gap-2" data-foldcontrols></div>
+          </div>
+          <div class="mt-2 flex gap-2">
+            <button class="flex-1 rounded-md border border-stone-300 bg-white px-2 py-1 text-xs" data-reset>Reset transform</button>
+            <button class="flex-1 rounded-md border border-stone-300 bg-white px-2 py-1 text-xs" data-clear>Clear fabric</button>
+          </div>
+        </div>
+      `);
+
+      const fabricList = panel.querySelector("[data-fabrics]");
+      fabrics.forEach(f => {
+        const btn = el(`<button data-fid="${f.id}" title="${esc(f.name)}" class="relative"></button>`);
+        getBlobURL(f.imageBlobKey).then(url => {
+          if (url) btn.innerHTML = `<img src="${url}" class="fabric-pick ${a.fabricId===f.id?'selected':''}" />`;
+        });
+        btn.addEventListener("click", async () => {
+          a.fabricId = f.id;
+          const url = await getBlobURL(f.imageBlobKey);
+          const { img: fimg } = await loadImage(url);
+          a.fabricImg = fimg;
+          await bumpUsage("fabric", f.id);
+          renderSidebar();
+          rebuildRegionsForRenderer();
+        });
+        fabricList.appendChild(btn);
+      });
+
+      const controls = panel.querySelector("[data-controls]");
+      const addSlider = (parent, label, min, max, step, value, unit, onInput) => {
+        const row = el(`
+          <div class="slider-row">
+            <label>${label}</label>
+            <input type="range" min="${min}" max="${max}" step="${step}" value="${value}" />
+            <span class="val">${value}${unit}</span>
+          </div>
+        `);
+        const inp = row.querySelector("input"); const val = row.querySelector(".val");
+        inp.addEventListener("input", (e) => {
+          const v = parseFloat(e.target.value);
+          val.textContent = `${v}${unit}`;
+          onInput(v);
+        });
+        parent.appendChild(row);
+      };
+
+      const rIdx = () => indexInRenderer(i);
+      addSlider(controls, "Rotation", 0, 360, 1, a.rotation, "°", (v) => { a.rotation = v; renderer.updateRegion(rIdx(), { rotation: v }); });
+      addSlider(controls, "Offset X", -500, 500, 1, a.offsetX, "", (v) => { a.offsetX = v; renderer.updateRegion(rIdx(), { offsetX: v }); });
+      addSlider(controls, "Offset Y", -500, 500, 1, a.offsetY, "", (v) => { a.offsetY = v; renderer.updateRegion(rIdx(), { offsetY: v }); });
+      addSlider(controls, "Scale", 0.5, 2, 0.01, a.scaleMult, "×", (v) => { a.scaleMult = v; renderer.updateRegion(rIdx(), { scaleMult: v }); });
+
+      const snapRow = el(`<div class="mt-1 flex gap-1"></div>`);
+      [0, 90, 180, 270].forEach(deg => {
+        const b = el(`<button class="rounded-md border border-stone-300 bg-white px-2 py-1 text-xs">${deg}°</button>`);
+        b.addEventListener("click", () => { a.rotation = deg; renderSidebar(); rebuildRegionsForRenderer(); });
+        snapRow.appendChild(b);
+      });
+      controls.appendChild(snapRow);
+
+      // Fold controls
+      const foldCheckbox = panel.querySelector("[data-foldon]");
+      const foldControls = panel.querySelector("[data-foldcontrols]");
+      const renderFoldControls = () => {
+        foldControls.innerHTML = "";
+        if (!a.foldOn) return;
+        addSlider(foldControls, "Strength", 0, 1.5, 0.05, a.foldStrength, "", (v) => {
+          a.foldStrength = v; renderer.updateRegion(rIdx(), { foldStrength: v });
+        });
+        const toggle = el(`
+          <div class="flex gap-1">
+            <button class="flex-1 rounded-md border px-2 py-1 text-xs ${!a.shadowsOnly ? 'bg-stone-900 text-white border-stone-900' : 'bg-white border-stone-300'}" data-mode="both">Shadows + highlights</button>
+            <button class="flex-1 rounded-md border px-2 py-1 text-xs ${a.shadowsOnly ? 'bg-stone-900 text-white border-stone-900' : 'bg-white border-stone-300'}" data-mode="shadows">Shadows only</button>
+          </div>
+        `);
+        toggle.querySelector('[data-mode="both"]').addEventListener("click", () => { a.shadowsOnly = false; renderFoldControls(); renderer.updateRegion(rIdx(), { shadowsOnly: false }); });
+        toggle.querySelector('[data-mode="shadows"]').addEventListener("click", () => { a.shadowsOnly = true; renderFoldControls(); renderer.updateRegion(rIdx(), { shadowsOnly: true }); });
+        foldControls.appendChild(toggle);
+      };
+      foldCheckbox.addEventListener("change", (e) => {
+        a.foldOn = e.target.checked;
+        renderFoldControls();
+        renderer.updateRegion(rIdx(), { foldOn: a.foldOn });
+      });
+      renderFoldControls();
+
+      panel.querySelector("[data-reset]").addEventListener("click", () => {
+        a.rotation = 0; a.offsetX = 0; a.offsetY = 0; a.scaleMult = 1;
+        a.foldOn = true; a.foldStrength = 0.8; a.shadowsOnly = false;
+        renderSidebar(); rebuildRegionsForRenderer();
+      });
+      panel.querySelector("[data-clear]").addEventListener("click", () => {
+        a.fabricId = null; a.fabricImg = null;
+        renderSidebar(); rebuildRegionsForRenderer();
+      });
+
+      sidebar.appendChild(panel);
+    });
+  };
+
+  // Map item-region index to the index in the compact assigned-regions list the renderer uses
+  const indexInRenderer = (itemRegionIndex) => {
+    let count = 0;
+    for (let i = 0; i < itemRegionIndex; i++) {
+      if (assignments[i].fabricId && assignments[i].fabricImg) count++;
+    }
+    return count;
+  };
+
+  renderSidebar();
+  renderer.draw();
+
+  main.querySelector("[data-export]").addEventListener("click", async () => {
+    const blob = await renderer.exportPNG();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `${item.name.replace(/[^a-z0-9]+/gi,'_')}_fabricswap.png`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    await bumpUsage("item", item.id);
+  });
+});
+</script>
+</body>
+</html>
