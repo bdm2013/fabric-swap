@@ -207,9 +207,16 @@ function ImageUpload(onPicked, label = "Upload image") {
   return node;
 }
 
-// Magnifier loupe — a circular zoomed preview that follows the pointer,
-// positioned above the finger so it never occludes the target.
-function createMagnifier({ imgEl, zoom = 2.5, size = 120 }) {
+// ------------------------------------------------------------
+// Magnifier loupe.
+// update(clientX, clientY, targetNX, targetNY, overlay)
+//   clientX/Y   where to place the loupe on screen (above the finger)
+//   targetNX/NY the point in the IMAGE (normalized 0..1) to center the zoom on
+//   overlay     optional { lines: [{x1,y1,x2,y2,color,width,dash}] } in normalized
+//               image coordinates, drawn inside the zoom so edges are visible.
+// The zoom is centered on the real target, not on the finger.
+// ------------------------------------------------------------
+function createMagnifier({ imgEl, zoom = 3, size = 130 }) {
   const loupe = document.createElement("div");
   loupe.style.cssText = `
     position: fixed;
@@ -223,30 +230,53 @@ function createMagnifier({ imgEl, zoom = 2.5, size = 120 }) {
     display: none;
     overflow: hidden;
   `;
-  const crosshair = document.createElement("div");
-  crosshair.style.cssText = `position: absolute; inset: 0; pointer-events: none;`;
-  crosshair.innerHTML = `
-    <svg width="100%" height="100%" viewBox="0 0 ${size} ${size}" style="position:absolute;inset:0;">
-      <line x1="${size/2}" y1="${size/2 - 10}" x2="${size/2}" y2="${size/2 + 10}" stroke="black" stroke-width="1"/>
-      <line x1="${size/2 - 10}" y1="${size/2}" x2="${size/2 + 10}" y2="${size/2}" stroke="black" stroke-width="1"/>
-      <circle cx="${size/2}" cy="${size/2}" r="2" fill="none" stroke="rgb(234,88,12)" stroke-width="1"/>
-    </svg>
-  `;
-  loupe.appendChild(crosshair);
+  const svgNS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("width", size);
+  svg.setAttribute("height", size);
+  svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+  svg.style.cssText = "position:absolute;inset:0;";
+  loupe.appendChild(svg);
   document.body.appendChild(loupe);
 
   const show = () => { loupe.style.display = "block"; };
   const hide = () => { loupe.style.display = "none"; };
 
-  const update = (clientX, clientY, imgX, imgY) => {
+  const update = (clientX, clientY, targetNX, targetNY, overlay) => {
     const r = imgEl.getBoundingClientRect();
     const bgW = r.width * zoom;
     const bgH = r.height * zoom;
-    const bgX = -(imgX * zoom) + size / 2;
-    const bgY = -(imgY * zoom) + size / 2;
+    const tx = targetNX * r.width;
+    const ty = targetNY * r.height;
+    const bgX = -(tx * zoom) + size / 2;
+    const bgY = -(ty * zoom) + size / 2;
     loupe.style.backgroundImage = `url("${imgEl.src}")`;
     loupe.style.backgroundSize = `${bgW}px ${bgH}px`;
     loupe.style.backgroundPosition = `${bgX}px ${bgY}px`;
+
+    // Map a normalized image coordinate to a loupe-local pixel
+    const toLoupe = (nx, ny) => ({
+      x: (nx * r.width) * zoom + bgX,
+      y: (ny * r.height) * zoom + bgY,
+    });
+
+    let html = "";
+    if (overlay && overlay.lines) {
+      for (const l of overlay.lines) {
+        const a = toLoupe(l.x1, l.y1), b = toLoupe(l.x2, l.y2);
+        html += `<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${l.color || 'rgb(234,88,12)'}" stroke-width="${l.width || 1.5}" ${l.dash ? `stroke-dasharray="${l.dash}"` : ""}/>`;
+      }
+    }
+    if (overlay && overlay.polygon && overlay.polygon.length > 1) {
+      const pts = overlay.polygon.map(p => { const q = toLoupe(p.x, p.y); return `${q.x},${q.y}`; }).join(" ");
+      html += `<polyline points="${pts}" fill="none" stroke="rgb(234,88,12)" stroke-width="1.5"/>`;
+    }
+    // Center crosshair (always at the true target)
+    const c = size / 2;
+    html += `<line x1="${c}" y1="${c - 10}" x2="${c}" y2="${c + 10}" stroke="black" stroke-width="1"/>`;
+    html += `<line x1="${c - 10}" y1="${c}" x2="${c + 10}" y2="${c}" stroke="black" stroke-width="1"/>`;
+    html += `<circle cx="${c}" cy="${c}" r="2" fill="none" stroke="rgb(234,88,12)" stroke-width="1"/>`;
+    svg.innerHTML = html;
 
     const offset = size / 2 + 30;
     let left = clientX - size / 2;
@@ -308,10 +338,16 @@ function CalibrateLine(imageUrl, onConfirm, onCancel) {
   let imgSize = null, dragging = null;
 
   const mag = createMagnifier({ imgEl: img, zoom: 3, size: 130 });
-  const showMagAt = (clientX, clientY) => {
-    const r = img.getBoundingClientRect();
+
+  // Center the loupe on the bar being dragged (its real position), and draw the bar inside it.
+  const showMagForBar = (clientX, clientY, which) => {
+    const p = which === "p1" ? p1 : p2;
+    const len = 0.03;
+    const bar = mode === "h"
+      ? { x1: p.x, y1: p.y - len, x2: p.x, y2: p.y + len }
+      : { x1: p.x - len, y1: p.y, x2: p.x + len, y2: p.y };
     mag.show();
-    mag.update(clientX, clientY, clientX - r.left, clientY - r.top);
+    mag.update(clientX, clientY, p.x, p.y, { lines: [{ ...bar, color: "rgb(234,88,12)", width: 2 }] });
   };
 
   const setMode = (m) => {
@@ -357,7 +393,7 @@ function CalibrateLine(imageUrl, onConfirm, onCancel) {
   const onDown = (which) => (e) => {
     e.preventDefault();
     dragging = which;
-    showMagAt(e.clientX, e.clientY);
+    showMagForBar(e.clientX, e.clientY, which);
   };
   h1.addEventListener("pointerdown", onDown("p1"));
   h2.addEventListener("pointerdown", onDown("p2"));
@@ -369,7 +405,7 @@ function CalibrateLine(imageUrl, onConfirm, onCancel) {
     if (mode === "h") { if (dragging === "p1") p1.x = x; else p2.x = x; p1.y = y; p2.y = y; }
     else              { if (dragging === "p1") p1.y = y; else p2.y = y; p1.x = x; p2.x = x; }
     update();
-    showMagAt(e.clientX, e.clientY);
+    showMagForBar(e.clientX, e.clientY, dragging);
   });
   const endDrag = () => { dragging = null; mag.hide(); };
   window.addEventListener("pointerup", endDrag);
@@ -395,6 +431,52 @@ function CalibrateLine(imageUrl, onConfirm, onCancel) {
     });
   });
   return node;
+}
+
+// ------------------------------------------------------------
+// Shared box-editing logic for crop and rectangle regions.
+// Given a drag type and the drag-start rect, computes the new rect and the
+// exact image point (normalized) the loupe should center on.
+// ------------------------------------------------------------
+function applyBoxDrag(drag, dx, dy, pointerNX, pointerNY) {
+  const min = 0.03;
+  let nr = { ...drag.startRect };
+  const t = drag.type;
+  if (t === "move") {
+    nr.x = Math.max(0, Math.min(1 - nr.w, nr.x + dx));
+    nr.y = Math.max(0, Math.min(1 - nr.h, nr.y + dy));
+    return { rect: nr, target: null };
+  }
+  if (t.includes("w")) { const nx = Math.max(0, Math.min(nr.x + nr.w - min, nr.x + dx)); nr.w += nr.x - nx; nr.x = nx; }
+  if (t.includes("e")) nr.w = Math.max(min, Math.min(1 - nr.x, nr.w + dx));
+  if (t.includes("n")) { const ny = Math.max(0, Math.min(nr.y + nr.h - min, nr.y + dy)); nr.h += nr.y - ny; nr.y = ny; }
+  if (t.includes("s")) nr.h = Math.max(min, Math.min(1 - nr.y, nr.h + dy));
+
+  // The true target = the actual corner/edge position after the drag
+  let tx, ty;
+  const left = nr.x, right = nr.x + nr.w, top = nr.y, bottom = nr.y + nr.h;
+  const clampNX = Math.max(left, Math.min(right, pointerNX));
+  const clampNY = Math.max(top, Math.min(bottom, pointerNY));
+  if (t === "nw") { tx = left; ty = top; }
+  else if (t === "ne") { tx = right; ty = top; }
+  else if (t === "sw") { tx = left; ty = bottom; }
+  else if (t === "se") { tx = right; ty = bottom; }
+  else if (t === "n") { tx = clampNX; ty = top; }
+  else if (t === "s") { tx = clampNX; ty = bottom; }
+  else if (t === "w") { tx = left; ty = clampNY; }
+  else { tx = right; ty = clampNY; } // "e"
+  return { rect: nr, target: { x: tx, y: ty } };
+}
+
+function boxOverlayLines(rect) {
+  const l = rect.x, r = rect.x + rect.w, t = rect.y, b = rect.y + rect.h;
+  const c = "rgb(234,88,12)";
+  return [
+    { x1: l, y1: t, x2: r, y2: t, color: c, width: 1.5 },
+    { x1: r, y1: t, x2: r, y2: b, color: c, width: 1.5 },
+    { x1: r, y1: b, x2: l, y2: b, color: c, width: 1.5 },
+    { x1: l, y1: b, x2: l, y2: t, color: c, width: 1.5 },
+  ];
 }
 
 function CropTool(imageUrl, onApply, onSkip, onCancel) {
@@ -438,12 +520,13 @@ function CropTool(imageUrl, onApply, onSkip, onCancel) {
 
   let rect = { x: 0, y: 0, w: 1, h: 1 };
   let drag = null, imgSize = null;
+  let lastTarget = null;
 
   const mag = createMagnifier({ imgEl: img, zoom: 3, size: 130 });
-  const showMagAt = (clientX, clientY) => {
-    const r = img.getBoundingClientRect();
+  const showMag = (clientX, clientY, target) => {
+    if (!target) return;
     mag.show();
-    mag.update(clientX, clientY, clientX - r.left, clientY - r.top);
+    mag.update(clientX, clientY, target.x, target.y, { lines: boxOverlayLines(rect) });
   };
 
   const ready = () => { imgSize = { w: img.naturalWidth, h: img.naturalHeight }; update(); };
@@ -451,11 +534,29 @@ function CropTool(imageUrl, onApply, onSkip, onCancel) {
   if (img.complete && img.naturalWidth) ready();
   window.addEventListener("resize", update);
 
+  // Where the corner/edge currently sits (used for the first loupe frame on pointerdown)
+  const handleTarget = (type, pointerNX, pointerNY) => {
+    const l = rect.x, r = rect.x + rect.w, t = rect.y, b = rect.y + rect.h;
+    const cx = Math.max(l, Math.min(r, pointerNX));
+    const cy = Math.max(t, Math.min(b, pointerNY));
+    if (type === "nw") return { x: l, y: t };
+    if (type === "ne") return { x: r, y: t };
+    if (type === "sw") return { x: l, y: b };
+    if (type === "se") return { x: r, y: b };
+    if (type === "n") return { x: cx, y: t };
+    if (type === "s") return { x: cx, y: b };
+    if (type === "w") return { x: l, y: cy };
+    return { x: r, y: cy };
+  };
+
   ["nw","ne","sw","se","n","s","w","e"].forEach(c => {
     node.querySelector(`[data-h="${c}"]`).addEventListener("pointerdown", (e) => {
       e.preventDefault(); e.stopPropagation();
       drag = { type: c, startX: e.clientX, startY: e.clientY, startRect: { ...rect } };
-      showMagAt(e.clientX, e.clientY);
+      const r = img.getBoundingClientRect();
+      const t = handleTarget(c, (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+      lastTarget = t;
+      showMag(e.clientX, e.clientY, t);
     });
   });
   moveLayer.addEventListener("pointerdown", (e) => {
@@ -470,19 +571,11 @@ function CropTool(imageUrl, onApply, onSkip, onCancel) {
     if (!drag) return;
     const r = img.getBoundingClientRect();
     const dx = (e.clientX - drag.startX) / r.width, dy = (e.clientY - drag.startY) / r.height;
-    let nr = { ...drag.startRect }; const min = 0.05;
-    if (drag.type === "move") {
-      nr.x = Math.max(0, Math.min(1 - nr.w, nr.x + dx));
-      nr.y = Math.max(0, Math.min(1 - nr.h, nr.y + dy));
-    } else {
-      if (drag.type.includes("w")) { const nx = Math.max(0, Math.min(nr.x + nr.w - min, nr.x + dx)); nr.w += nr.x - nx; nr.x = nx; }
-      if (drag.type.includes("e")) nr.w = Math.max(min, Math.min(1 - nr.x, nr.w + dx));
-      if (drag.type.includes("n")) { const ny = Math.max(0, Math.min(nr.y + nr.h - min, nr.y + dy)); nr.h += nr.y - ny; nr.y = ny; }
-      if (drag.type.includes("s")) nr.h = Math.max(min, Math.min(1 - nr.y, nr.h + dy));
-    }
-    rect = nr;
+    const pnx = (e.clientX - r.left) / r.width, pny = (e.clientY - r.top) / r.height;
+    const res = applyBoxDrag(drag, dx, dy, pnx, pny);
+    rect = res.rect;
     update();
-    if (drag.type !== "move") showMagAt(e.clientX, e.clientY);
+    if (res.target) { lastTarget = res.target; showMag(e.clientX, e.clientY, res.target); }
   });
   const endDrag = () => { drag = null; mag.hide(); };
   window.addEventListener("pointerup", endDrag);
@@ -586,7 +679,7 @@ function TagEditor({ initialTags = [], onChange }) {
 }
 
 // ============================================================
-// SAM
+// SAM (unchanged — loading is a known open issue)
 // ============================================================
 const SAM_ENCODER_URL = "https://huggingface.co/Xenova/slimsam-77-uniform/resolve/main/onnx/vision_encoder.onnx";
 const SAM_DECODER_URL = "https://huggingface.co/Xenova/slimsam-77-uniform/resolve/main/onnx/mask_decoder.onnx";
@@ -920,7 +1013,6 @@ function maskBoundingBox(maskImg) {
 }
 
 // Heavily blurred copy of the item image = low-frequency lighting only (no pattern).
-// Downscale -> blur -> upscale so very large effective blur radii stay cheap.
 function buildLowFreqLighting(itemImg, bboxPx) {
   const w = itemImg.naturalWidth, h = itemImg.naturalHeight;
   const targetRadius = Math.max(bboxPx.w, bboxPx.h) / 20;
@@ -946,8 +1038,6 @@ function buildLowFreqLighting(itemImg, bboxPx) {
   return out;
 }
 
-// Mean luminance of the low-freq image inside the mask (the "neutral" value
-// we normalize against so shading is centered on 1.0).
 function computeLowFreqMean(lowFreqCanvas, maskImg) {
   const w = lowFreqCanvas.width, h = lowFreqCanvas.height;
   const ldat = lowFreqCanvas.getContext("2d").getImageData(0, 0, w, h).data;
@@ -1323,7 +1413,7 @@ route("/items/:id", async (main, { id }) => {
         <input class="flex-1 min-w-0 rounded-md border border-transparent bg-transparent px-2 py-1 text-2xl font-semibold hover:border-stone-200 focus:border-stone-300 focus:bg-white outline-none" value="${esc(item.name)}" data-name />
         <div class="flex flex-wrap gap-2">
           <a href="#/items/${item.id}/segment" class="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium whitespace-nowrap">
-            ${(item.regions || []).length ? "Edit regions" : "Segment (SAM)"}
+            ${(item.regions || []).length ? "Edit regions (SAM)" : "Segment (SAM)"}
           </a>
           <a href="#/items/${item.id}/manual-region" class="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium whitespace-nowrap">
             + Manual region
@@ -1403,11 +1493,16 @@ route("/items/:id", async (main, { id }) => {
     if (regs.length === 0) { regionsList.innerHTML = `<div class="text-sm text-stone-500">No regions yet.</div>`; return; }
     regionsList.innerHTML = "";
     regs.forEach((reg, i) => {
+      // Only manual regions that have a stored shape can be re-edited
+      const editable = reg.shape && (reg.shape.type === "rect" || reg.shape.type === "poly");
       regionsList.appendChild(el(`
         <div class="flex items-center gap-3">
           <div class="region-swatch" style="background:${colors[i % colors.length]}"></div>
           <div class="flex-1 truncate text-sm">${esc(reg.label || `Region ${i+1}`)}</div>
           <div class="text-xs text-stone-500">${reg.role || ""}</div>
+          ${editable
+            ? `<a href="#/items/${item.id}/manual-region/${reg.id}" class="rounded-md border border-stone-300 bg-white px-2 py-1 text-xs">Edit shape</a>`
+            : `<span class="text-[10px] text-stone-400">${reg.source === "manual" || !reg.shape ? "no shape saved" : ""}</span>`}
         </div>
       `));
     });
@@ -1698,6 +1793,7 @@ route("/items/:id/segment", async (main, { id }) => {
       label: labelInput.value.trim() || `Region ${(item.regions || []).length + 1}`,
       maskBlobKey: maskKey, bbox, areaPx: area,
       role: roleSelect.value || null,
+      source: "sam",
     };
     item.regions = [...(item.regions || []), region];
     item.updatedAt = Date.now();
@@ -1712,27 +1808,41 @@ route("/items/:id/segment", async (main, { id }) => {
   renderSaved();
 });
 
-// ---------- Manual region (rectangle or polygon) ----------
-route("/items/:id/manual-region", async (main, { id }) => {
+// ============================================================
+// Manual region editor (rectangle + polygon). Handles both creating a new
+// region and re-editing a saved one (route with :regionId).
+// ============================================================
+async function manualRegionPage(main, { id, regionId }) {
   const item = await getItem(id);
   if (!item) { main.innerHTML = `<div class="p-6">Item not found.</div>`; return; }
   const imgUrl = await getBlobURL(item.imageBlobKey);
   const { img: itemImg } = await loadImage(imgUrl);
 
+  const editingRegion = regionId ? (item.regions || []).find(r => r.id === regionId) : null;
+  if (regionId && (!editingRegion || !editingRegion.shape)) {
+    main.innerHTML = `<div class="p-6">This region has no saved shape and can't be edited. Delete it and redraw it. <a class="underline" href="#/items/${esc(id)}">Back</a></div>`;
+    return;
+  }
+
   main.innerHTML = `
     <div class="mx-auto max-w-4xl p-6">
       <div class="mb-4 flex items-center justify-between gap-3">
-        <h1 class="text-2xl font-semibold truncate">Manual region · ${esc(item.name)}</h1>
+        <h1 class="text-2xl font-semibold truncate">${editingRegion ? "Edit shape" : "Manual region"} · ${esc(item.name)}</h1>
         <a href="#/items/${item.id}" class="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium">Cancel</a>
       </div>
-      <div class="mb-3 flex gap-2">
+      <div class="mb-3 flex gap-2" data-modebar>
         <button class="flex-1 rounded-lg px-3 py-2 text-sm font-medium border" data-mode="rect">Rectangle</button>
         <button class="flex-1 rounded-lg px-3 py-2 text-sm font-medium border" data-mode="poly">Polygon</button>
+      </div>
+      <div class="mb-3 hidden flex-wrap gap-2" data-polybar>
+        <button class="rounded-lg px-3 py-2 text-sm font-medium border" data-addtoggle>Add points: off</button>
+        <button class="rounded-lg border border-red-200 bg-white px-3 py-2 text-sm font-medium text-red-600 disabled:opacity-40" data-delpoint disabled>Delete point</button>
+        <button class="rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium" data-undo>Undo last point</button>
       </div>
       <div class="relative mx-auto select-none touch-none" data-stage style="display:inline-block;max-width:100%">
         <img data-img src="${imgUrl}" class="block max-w-full rounded-xl" draggable="false" />
         <svg class="pointer-events-none absolute inset-0 h-full w-full" data-svg></svg>
-        <div class="absolute inset-0" data-click style="cursor:crosshair"></div>
+        <div class="absolute inset-0" data-click style="cursor:crosshair;touch-action:none"></div>
       </div>
       <p class="mt-2 text-xs text-stone-500" data-hint></p>
       <div class="mt-4 rounded-xl bg-white p-3 shadow-sm">
@@ -1745,7 +1855,7 @@ route("/items/:id/manual-region", async (main, { id }) => {
           </select>
           <div class="flex gap-2">
             <button class="flex-1 rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm font-medium" data-reset>Reset</button>
-            <button class="flex-1 rounded-lg bg-stone-900 px-3 py-2 text-sm font-medium text-white" data-save>Save region</button>
+            <button class="flex-1 rounded-lg bg-stone-900 px-3 py-2 text-sm font-medium text-white" data-save>${editingRegion ? "Save changes" : "Save region"}</button>
           </div>
         </div>
       </div>
@@ -1756,30 +1866,72 @@ route("/items/:id/manual-region", async (main, { id }) => {
   const svg = main.querySelector("[data-svg]");
   const clickLayer = main.querySelector("[data-click]");
   const hint = main.querySelector("[data-hint]");
+  const modeBar = main.querySelector("[data-modebar]");
+  const polyBar = main.querySelector("[data-polybar]");
   const modeRectBtn = main.querySelector('[data-mode="rect"]');
   const modePolyBtn = main.querySelector('[data-mode="poly"]');
+  const addToggle = main.querySelector("[data-addtoggle]");
+  const delPointBtn = main.querySelector("[data-delpoint]");
+  const undoBtn = main.querySelector("[data-undo]");
+  const labelInput = main.querySelector("[data-label]");
+  const roleSelect = main.querySelector("[data-role]");
 
+  // ---- State (all coordinates normalized 0..1 in image space) ----
   let mode = "rect";
-  let rect = null;       // { x, y, w, h } normalized
-  let rectDrag = null;
-  let polyPoints = [];   // normalized
+  let rect = null;                 // committed rectangle, always editable
+  let rectDrag = null;             // active rect edit drag, or the initial draw drag
+  let drawingRect = null;          // {startX,startY} while first drawing a rectangle
+  let polyPoints = [];             // committed polygon points
   let polyClosed = false;
+  let addMode = false;             // polygon: tapping adds points
+  let selectedPoint = -1;          // polygon: selected vertex index
+  let pointDrag = null;            // {index} while dragging an existing vertex
+  let pending = null;              // polygon placement in progress: {x,y} not yet committed
 
   const mag = createMagnifier({ imgEl, zoom: 3, size: 130 });
-  const showMagAt = (clientX, clientY) => {
-    const r = imgEl.getBoundingClientRect();
-    mag.show();
-    mag.update(clientX, clientY, clientX - r.left, clientY - r.top);
-  };
 
-  const updateModeButtons = () => {
+  const toNorm = (e) => {
+    const r = imgEl.getBoundingClientRect();
+    return {
+      x: (e.clientX - r.left) / r.width,
+      y: (e.clientY - r.top) / r.height,
+      inside: e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom,
+    };
+  };
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
+
+  // Prefill when editing a saved region
+  if (editingRegion) {
+    labelInput.value = editingRegion.label || "";
+    roleSelect.value = editingRegion.role || "";
+    const s = editingRegion.shape;
+    if (s.type === "rect") { mode = "rect"; rect = { ...s.rect }; }
+    else { mode = "poly"; polyPoints = s.points.map(p => ({ ...p })); polyClosed = true; }
+    // Shape type can't change when re-editing
+    modeBar.classList.add("hidden");
+  }
+
+  const updateUI = () => {
     const active = "bg-stone-900 text-white border-stone-900";
     const inactive = "bg-white text-stone-700 border-stone-300";
     modeRectBtn.className = `flex-1 rounded-lg px-3 py-2 text-sm font-medium border ${mode === 'rect' ? active : inactive}`;
     modePolyBtn.className = `flex-1 rounded-lg px-3 py-2 text-sm font-medium border ${mode === 'poly' ? active : inactive}`;
-    hint.textContent = mode === "rect"
-      ? "Drag to draw a rectangle. Drag again to redraw."
-      : "Tap to add points. Tap the first point (or press Enter) to close. Right-click or press Backspace to undo.";
+    polyBar.classList.toggle("hidden", mode !== "poly");
+    polyBar.classList.toggle("flex", mode === "poly");
+    addToggle.className = `rounded-lg px-3 py-2 text-sm font-medium border ${addMode ? active : inactive}`;
+    addToggle.textContent = addMode ? "Add points: ON" : "Add points: off";
+    delPointBtn.disabled = selectedPoint < 0;
+    if (mode === "rect") {
+      hint.textContent = rect
+        ? "Drag the corners or edges to resize, or drag inside the box to move it."
+        : "Drag on the image to draw a rectangle.";
+    } else if (!polyClosed && polyPoints.length < 3) {
+      hint.textContent = "Press and hold to position a point (the loupe helps), then lift your finger to place it. Close the shape by placing a point on the first one, or press Enter.";
+    } else if (addMode) {
+      hint.textContent = "Add points is ON. Press, fine-tune, and lift to add. A point placed near an edge is inserted into that edge.";
+    } else {
+      hint.textContent = "Drag any point to move it. Tap a point to select it, then use Delete point. Turn on Add points to insert more.";
+    }
   };
 
   const redraw = () => {
@@ -1789,6 +1941,10 @@ route("/items/:id/manual-region", async (main, { id }) => {
     if (mode === "rect" && rect) {
       const x = rect.x * r.width, y = rect.y * r.height, w = rect.w * r.width, h = rect.h * r.height;
       html += `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="rgba(234,88,12,0.25)" stroke="rgb(234,88,12)" stroke-width="2"/>`;
+      const corners = [[x,y],[x+w,y],[x,y+h],[x+w,y+h]];
+      for (const [cx, cy] of corners) html += `<rect x="${cx-8}" y="${cy-8}" width="16" height="16" rx="3" fill="white" stroke="rgb(234,88,12)" stroke-width="2"/>`;
+      const mids = [[x+w/2,y],[x+w/2,y+h],[x,y+h/2],[x+w,y+h/2]];
+      for (const [cx, cy] of mids) html += `<rect x="${cx-6}" y="${cy-6}" width="12" height="12" rx="2" fill="white" stroke="rgb(234,88,12)" stroke-width="2"/>`;
     } else if (mode === "poly" && polyPoints.length > 0) {
       const pts = polyPoints.map(p => `${p.x * r.width},${p.y * r.height}`).join(" ");
       if (polyClosed || polyPoints.length >= 3) {
@@ -1798,79 +1954,290 @@ route("/items/:id/manual-region", async (main, { id }) => {
       }
       for (let i = 0; i < polyPoints.length; i++) {
         const p = polyPoints[i];
-        html += `<circle cx="${p.x * r.width}" cy="${p.y * r.height}" r="${i === 0 ? 7 : 5}" fill="white" stroke="rgb(234,88,12)" stroke-width="2"/>`;
+        const sel = i === selectedPoint;
+        html += `<circle cx="${p.x * r.width}" cy="${p.y * r.height}" r="${sel ? 9 : (i === 0 ? 7 : 6)}" fill="${sel ? 'rgb(239,68,68)' : 'white'}" stroke="${sel ? 'white' : 'rgb(234,88,12)'}" stroke-width="2"/>`;
       }
+    }
+    // Pending polygon point preview (not committed yet)
+    if (mode === "poly" && pending) {
+      const px = pending.x * r.width, py = pending.y * r.height;
+      if (polyPoints.length > 0 && !polyClosed) {
+        const last = polyPoints[polyPoints.length - 1];
+        html += `<line x1="${last.x * r.width}" y1="${last.y * r.height}" x2="${px}" y2="${py}" stroke="rgb(234,88,12)" stroke-width="1.5" stroke-dasharray="4 3"/>`;
+      }
+      html += `<line x1="${px-10}" y1="${py}" x2="${px+10}" y2="${py}" stroke="black" stroke-width="1"/>`;
+      html += `<line x1="${px}" y1="${py-10}" x2="${px}" y2="${py+10}" stroke="black" stroke-width="1"/>`;
+      html += `<circle cx="${px}" cy="${py}" r="4" fill="none" stroke="rgb(234,88,12)" stroke-width="1.5"/>`;
     }
     svg.innerHTML = html;
   };
 
-  const resetShape = () => { rect = null; polyPoints = []; polyClosed = false; redraw(); };
-  const setMode = (m) => { mode = m; resetShape(); updateModeButtons(); };
-  modeRectBtn.addEventListener("click", () => setMode("rect"));
-  modePolyBtn.addEventListener("click", () => setMode("poly"));
+  const refresh = () => { updateUI(); redraw(); };
+
+  const resetShape = () => {
+    rect = null; polyPoints = []; polyClosed = false; selectedPoint = -1;
+    pending = null; addMode = false; rectDrag = null; drawingRect = null; pointDrag = null;
+    mag.hide(); refresh();
+  };
+  const setMode = (m) => { mode = m; resetShape(); };
+  modeRectBtn.addEventListener("click", () => { if (!editingRegion) setMode("rect"); });
+  modePolyBtn.addEventListener("click", () => { if (!editingRegion) setMode("poly"); });
 
   window.addEventListener("resize", redraw);
-  imgEl.addEventListener("load", redraw);
-  if (imgEl.complete && imgEl.naturalWidth) redraw();
+  imgEl.addEventListener("load", refresh);
+  if (imgEl.complete && imgEl.naturalWidth) refresh();
 
-  clickLayer.addEventListener("pointerdown", (e) => {
+  // ---------- Hit testing ----------
+  const hitRadiusPx = 18;
+  const hitPoint = (n) => {
     const r = imgEl.getBoundingClientRect();
-    const x = (e.clientX - r.left) / r.width;
-    const y = (e.clientY - r.top) / r.height;
+    let best = -1, bestD = hitRadiusPx;
+    polyPoints.forEach((p, i) => {
+      const d = Math.hypot((p.x - n.x) * r.width, (p.y - n.y) * r.height);
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    return best;
+  };
+  const hitRectHandle = (n) => {
+    if (!rect) return null;
+    const r = imgEl.getBoundingClientRect();
+    const px = (v, dim) => v * dim;
+    const l = px(rect.x, r.width), rr = px(rect.x + rect.w, r.width);
+    const t = px(rect.y, r.height), b = px(rect.y + rect.h, r.height);
+    const x = n.x * r.width, y = n.y * r.height;
+    const tol = 16;
+    const nearL = Math.abs(x - l) < tol, nearR = Math.abs(x - rr) < tol;
+    const nearT = Math.abs(y - t) < tol, nearB = Math.abs(y - b) < tol;
+    const inX = x > l - tol && x < rr + tol, inY = y > t - tol && y < b + tol;
+    if (nearL && nearT) return "nw";
+    if (nearR && nearT) return "ne";
+    if (nearL && nearB) return "sw";
+    if (nearR && nearB) return "se";
+    if (nearT && inX) return "n";
+    if (nearB && inX) return "s";
+    if (nearL && inY) return "w";
+    if (nearR && inY) return "e";
+    if (x > l && x < rr && y > t && y < b) return "move";
+    return null;
+  };
+  // Distance from a point to a segment (in screen pixels) and the projected position
+  const nearestEdge = (n) => {
+    const r = imgEl.getBoundingClientRect();
+    const px = n.x * r.width, py = n.y * r.height;
+    let best = { idx: -1, d: Infinity };
+    const count = polyPoints.length;
+    for (let i = 0; i < count; i++) {
+      const a = polyPoints[i], b = polyPoints[(i + 1) % count];
+      if (!polyClosed && i === count - 1) break;
+      const ax = a.x * r.width, ay = a.y * r.height, bx = b.x * r.width, by = b.y * r.height;
+      const dx = bx - ax, dy = by - ay;
+      const len2 = dx * dx + dy * dy || 1;
+      const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2));
+      const d = Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+      if (d < best.d) best = { idx: i, d };
+    }
+    return best;
+  };
+
+  // ---------- Pointer handling ----------
+  clickLayer.addEventListener("pointerdown", (e) => {
+    const n = toNorm(e);
+    clickLayer.setPointerCapture?.(e.pointerId);
+
     if (mode === "rect") {
       e.preventDefault();
-      rectDrag = { startX: x, startY: y };
-      rect = { x, y, w: 0, h: 0 };
-      showMagAt(e.clientX, e.clientY);
-      redraw();
-    } else {
-      // Polygon: flash the loupe so the user can verify where the point landed
-      showMagAt(e.clientX, e.clientY);
-      setTimeout(() => mag.hide(), 500);
-      if (polyClosed) return;
-      if (polyPoints.length >= 3) {
-        const first = polyPoints[0];
-        const dx = (x - first.x) * r.width, dy = (y - first.y) * r.height;
-        if (Math.hypot(dx, dy) < 14) { polyClosed = true; redraw(); return; }
+      const handle = hitRectHandle(n);
+      if (rect && handle) {
+        rectDrag = { type: handle, startX: e.clientX, startY: e.clientY, startRect: { ...rect } };
+        if (handle !== "move") {
+          const t = rectHandleTarget(handle, rect, n.x, n.y);
+          mag.show(); mag.update(e.clientX, e.clientY, t.x, t.y, { lines: boxOverlayLines(rect) });
+        }
+      } else if (!rect) {
+        drawingRect = { startX: clamp01(n.x), startY: clamp01(n.y) };
+        rect = { x: drawingRect.startX, y: drawingRect.startY, w: 0, h: 0 };
+        mag.show(); mag.update(e.clientX, e.clientY, clamp01(n.x), clamp01(n.y), null);
+        refresh();
       }
-      polyPoints.push({ x, y });
+      return;
+    }
+
+    // ---- Polygon ----
+    e.preventDefault();
+    const hit = hitPoint(n);
+    if (!addMode && hit >= 0 && (polyClosed || polyPoints.length >= 1)) {
+      // Start dragging an existing vertex and select it
+      selectedPoint = hit;
+      pointDrag = { index: hit };
+      const p = polyPoints[hit];
+      mag.show(); mag.update(e.clientX, e.clientY, p.x, p.y, { polygon: polyPointsForLoupe() });
+      refresh();
+      return;
+    }
+    // Begin a placement. Nothing is committed until the finger is lifted.
+    pending = { x: clamp01(n.x), y: clamp01(n.y) };
+    mag.show(); mag.update(e.clientX, e.clientY, pending.x, pending.y, { polygon: polyPointsForLoupe(pending) });
+    redraw();
+  });
+
+  const rectHandleTarget = (type, rc, pnx, pny) => {
+    const l = rc.x, r = rc.x + rc.w, t = rc.y, b = rc.y + rc.h;
+    const cx = Math.max(l, Math.min(r, pnx)), cy = Math.max(t, Math.min(b, pny));
+    if (type === "nw") return { x: l, y: t };
+    if (type === "ne") return { x: r, y: t };
+    if (type === "sw") return { x: l, y: b };
+    if (type === "se") return { x: r, y: b };
+    if (type === "n") return { x: cx, y: t };
+    if (type === "s") return { x: cx, y: b };
+    if (type === "w") return { x: l, y: cy };
+    return { x: r, y: cy };
+  };
+
+  // Polyline of existing points (+ optional pending point) to draw inside the loupe
+  function polyPointsForLoupe(extra) {
+    const pts = polyPoints.map(p => ({ x: p.x, y: p.y }));
+    if (extra && !polyClosed) pts.push({ x: extra.x, y: extra.y });
+    return pts;
+  }
+
+  clickLayer.addEventListener("pointermove", (e) => {
+    const n = toNorm(e);
+
+    if (mode === "rect") {
+      if (drawingRect) {
+        const x = clamp01(n.x), y = clamp01(n.y);
+        rect = {
+          x: Math.min(drawingRect.startX, x),
+          y: Math.min(drawingRect.startY, y),
+          w: Math.abs(x - drawingRect.startX),
+          h: Math.abs(y - drawingRect.startY),
+        };
+        mag.update(e.clientX, e.clientY, x, y, { lines: boxOverlayLines(rect) });
+        refresh();
+      } else if (rectDrag) {
+        const r = imgEl.getBoundingClientRect();
+        const dx = (e.clientX - rectDrag.startX) / r.width, dy = (e.clientY - rectDrag.startY) / r.height;
+        const res = applyBoxDrag(rectDrag, dx, dy, n.x, n.y);
+        rect = res.rect;
+        if (res.target) { mag.show(); mag.update(e.clientX, e.clientY, res.target.x, res.target.y, { lines: boxOverlayLines(rect) }); }
+        refresh();
+      }
+      return;
+    }
+
+    // ---- Polygon ----
+    if (pointDrag) {
+      const x = clamp01(n.x), y = clamp01(n.y);
+      polyPoints[pointDrag.index] = { x, y };
+      mag.update(e.clientX, e.clientY, x, y, { polygon: polyPointsForLoupe() });
+      redraw();
+    } else if (pending) {
+      pending = { x: clamp01(n.x), y: clamp01(n.y) };
+      pending.outside = !n.inside;
+      mag.update(e.clientX, e.clientY, pending.x, pending.y, { polygon: polyPointsForLoupe(pending) });
       redraw();
     }
   });
-  clickLayer.addEventListener("pointermove", (e) => {
-    if (mode !== "rect" || !rectDrag) return;
-    const r = imgEl.getBoundingClientRect();
-    const x = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-    const y = Math.max(0, Math.min(1, (e.clientY - r.top) / r.height));
-    rect = {
-      x: Math.min(rectDrag.startX, x),
-      y: Math.min(rectDrag.startY, y),
-      w: Math.abs(x - rectDrag.startX),
-      h: Math.abs(y - rectDrag.startY),
-    };
-    redraw();
-    showMagAt(e.clientX, e.clientY);
-  });
-  const endRectDrag = () => { rectDrag = null; if (mode === "rect") mag.hide(); };
-  window.addEventListener("pointerup", endRectDrag);
-  window.addEventListener("pointercancel", endRectDrag);
 
-  clickLayer.addEventListener("contextmenu", (e) => {
-    if (mode !== "poly") return;
-    e.preventDefault();
+  const finishPointer = (e, cancelled) => {
+    if (mode === "rect") {
+      if (drawingRect) {
+        drawingRect = null;
+        if (!rect || rect.w < 0.01 || rect.h < 0.01) rect = null; // ignore accidental taps
+      }
+      rectDrag = null;
+      mag.hide(); refresh();
+      return;
+    }
+
+    // ---- Polygon ----
+    if (pointDrag) {
+      pointDrag = null;
+      mag.hide(); refresh();
+      return;
+    }
+    if (pending) {
+      const p = pending;
+      pending = null;
+      mag.hide();
+      // Dragging off the image before lifting cancels the placement
+      if (cancelled || p.outside) { refresh(); return; }
+      commitPoint(p);
+    }
+  };
+  clickLayer.addEventListener("pointerup", (e) => finishPointer(e, false));
+  clickLayer.addEventListener("pointercancel", (e) => finishPointer(e, true));
+
+  function commitPoint(p) {
+    const r = imgEl.getBoundingClientRect();
+    // Closing: placing a point on the first vertex closes an open shape
+    if (!polyClosed && polyPoints.length >= 3) {
+      const first = polyPoints[0];
+      if (Math.hypot((p.x - first.x) * r.width, (p.y - first.y) * r.height) < 16) {
+        polyClosed = true; selectedPoint = -1; refresh(); return;
+      }
+    }
+    if (polyClosed && !addMode) { refresh(); return; }
+
+    if (polyClosed && addMode) {
+      // Insert into the nearest edge
+      const edge = nearestEdge(p);
+      if (edge.idx >= 0) {
+        polyPoints.splice(edge.idx + 1, 0, { x: p.x, y: p.y });
+        selectedPoint = edge.idx + 1;
+      }
+    } else if (addMode && polyPoints.length >= 3) {
+      // Open shape in add mode: insert on nearest edge if close, else append
+      const edge = nearestEdge(p);
+      if (edge.idx >= 0 && edge.d < 20) {
+        polyPoints.splice(edge.idx + 1, 0, { x: p.x, y: p.y });
+        selectedPoint = edge.idx + 1;
+      } else {
+        polyPoints.push({ x: p.x, y: p.y });
+        selectedPoint = polyPoints.length - 1;
+      }
+    } else {
+      polyPoints.push({ x: p.x, y: p.y });
+      selectedPoint = polyPoints.length - 1;
+    }
+    refresh();
+  }
+
+  // Polygon controls
+  addToggle.addEventListener("click", () => {
+    if (polyPoints.length < 3 && !polyClosed) { addMode = false; }
+    else addMode = !addMode;
+    refresh();
+  });
+  delPointBtn.addEventListener("click", () => {
+    if (selectedPoint < 0) return;
+    if (polyPoints.length <= 3 && polyClosed) { alert("A polygon needs at least 3 points."); return; }
+    polyPoints.splice(selectedPoint, 1);
+    selectedPoint = -1;
+    if (polyPoints.length < 3) polyClosed = false;
+    refresh();
+  });
+  undoBtn.addEventListener("click", () => {
     if (polyClosed) polyClosed = false;
     else polyPoints.pop();
-    redraw();
+    selectedPoint = -1;
+    refresh();
   });
+
+  clickLayer.addEventListener("contextmenu", (e) => { if (mode === "poly") e.preventDefault(); });
 
   const keyHandler = (e) => {
     if (mode !== "poly") return;
-    if (e.key === "Enter" && polyPoints.length >= 3) { polyClosed = true; redraw(); }
-    else if (e.key === "Backspace") { if (polyClosed) polyClosed = false; else polyPoints.pop(); redraw(); }
+    if (e.key === "Enter" && polyPoints.length >= 3) { polyClosed = true; selectedPoint = -1; refresh(); }
+    else if (e.key === "Backspace" && document.activeElement?.tagName !== "INPUT") {
+      if (selectedPoint >= 0 && polyPoints.length > 3) { polyPoints.splice(selectedPoint, 1); selectedPoint = -1; }
+      else if (polyClosed) polyClosed = false;
+      else polyPoints.pop();
+      refresh();
+    }
   };
   window.addEventListener("keydown", keyHandler);
 
-  // Clean up the loupe and listeners when leaving this route
   const cleanup = () => {
     mag.destroy();
     window.removeEventListener("keydown", keyHandler);
@@ -1878,8 +2245,18 @@ route("/items/:id/manual-region", async (main, { id }) => {
   };
   window.addEventListener("hashchange", cleanup);
 
-  main.querySelector("[data-reset]").addEventListener("click", resetShape);
+  main.querySelector("[data-reset]").addEventListener("click", () => {
+    if (editingRegion) {
+      // Restore the originally saved shape
+      const s = editingRegion.shape;
+      resetShape();
+      if (s.type === "rect") rect = { ...s.rect };
+      else { polyPoints = s.points.map(p => ({ ...p })); polyClosed = true; }
+      refresh();
+    } else resetShape();
+  });
 
+  // ---------- Save ----------
   main.querySelector("[data-save]").addEventListener("click", async () => {
     const w = itemImg.naturalWidth, h = itemImg.naturalHeight;
     const canvas = document.createElement("canvas");
@@ -1888,9 +2265,10 @@ route("/items/:id/manual-region", async (main, { id }) => {
     ctx.fillStyle = "black"; ctx.fillRect(0, 0, w, h);
     ctx.fillStyle = "white";
 
-    let ok = false;
+    let ok = false, shape = null;
     if (mode === "rect" && rect && rect.w > 0.005 && rect.h > 0.005) {
       ctx.fillRect(rect.x * w, rect.y * h, rect.w * w, rect.h * h);
+      shape = { type: "rect", rect: { ...rect } };
       ok = true;
     } else if (mode === "poly" && polyPoints.length >= 3) {
       ctx.beginPath();
@@ -1899,6 +2277,7 @@ route("/items/:id/manual-region", async (main, { id }) => {
         if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
       });
       ctx.closePath(); ctx.fill();
+      shape = { type: "poly", points: polyPoints.map(p => ({ ...p })) };
       ok = true;
     }
     if (!ok) { alert("Draw a shape first."); return; }
@@ -1913,29 +2292,40 @@ route("/items/:id/manual-region", async (main, { id }) => {
       }
     }
     const bbox = area > 0 ? [minX, minY, maxX - minX, maxY - minY] : [0, 0, 0, 0];
-
     const blob = await new Promise(res => canvas.toBlob(res, "image/png"));
-    const regionId = uid();
-    const maskKey = `item-${item.id}-mask-${regionId}`;
-    await putBlob(maskKey, blob);
 
-    const labelInput = main.querySelector("[data-label]");
-    const roleSelect = main.querySelector("[data-role]");
-    const region = {
-      id: regionId,
-      label: labelInput.value.trim() || `Region ${(item.regions || []).length + 1}`,
-      maskBlobKey: maskKey, bbox, areaPx: area,
-      role: roleSelect.value || null,
-    };
-    item.regions = [...(item.regions || []), region];
+    if (editingRegion) {
+      // Overwrite the existing mask blob and update the region in place
+      await putBlob(editingRegion.maskBlobKey, blob);
+      editingRegion.bbox = bbox;
+      editingRegion.areaPx = area;
+      editingRegion.shape = shape;
+      editingRegion.label = labelInput.value.trim() || editingRegion.label;
+      editingRegion.role = roleSelect.value || null;
+    } else {
+      const newId = uid();
+      const maskKey = `item-${item.id}-mask-${newId}`;
+      await putBlob(maskKey, blob);
+      item.regions = [...(item.regions || []), {
+        id: newId,
+        label: labelInput.value.trim() || `Region ${(item.regions || []).length + 1}`,
+        maskBlobKey: maskKey, bbox, areaPx: area,
+        role: roleSelect.value || null,
+        source: "manual",
+        shape,
+      }];
+    }
     item.updatedAt = Date.now();
     await putItem(item);
     cleanup();
     navigate(`#/items/${item.id}`);
   });
 
-  updateModeButtons();
-});
+  refresh();
+}
+
+route("/items/:id/manual-region", (main, params) => manualRegionPage(main, params));
+route("/items/:id/manual-region/:regionId", (main, params) => manualRegionPage(main, params));
 
 // ---------- Try fabrics ----------
 route("/items/:id/try", async (main, { id }) => {
